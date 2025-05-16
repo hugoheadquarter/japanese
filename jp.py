@@ -1,4 +1,3 @@
-# analysis_app.py
 import streamlit as st
 import yt_dlp
 import os
@@ -2080,7 +2079,7 @@ st.title("일본어 🇯🇵")
 # ───────── sidebar navigation ─────────
 side = st.sidebar
 choice = side.radio(
-    "**메뉴**",
+    "",
     ("Home", "History", "Sources"),
     index=0,
 )
