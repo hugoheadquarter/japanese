@@ -1,0 +1,29 @@
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Virtual environment
+venv/
+
+# Environment and config files
+.env
+*.json
+app_config.json
+
+# Temp & output directories
+temp_video_downloads/
+trash/
+
+# Logs and temporary text files
+*.log
+*.txt
+
+# Audio and media files
+*.mp3
+*.wav
+*.ogg
+*.m4a
+*.flac
+
+# MacOS metadata
+.DS_Store
