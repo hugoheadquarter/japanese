@@ -17,6 +17,22 @@ import shutil
 import traceback
 import sys # For sys.exit
 
+# Set page config here (once only)
+st.set_page_config(page_title="動画分析")
+
+# Load environment variables early
+load_dotenv()
+DEEPGRAM_API_KEY = os.getenv('DEEPGRAM_API_KEY')
+OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
+
+# Import fuzzy matching early so it's available to all helper functions
+try:
+    from rapidfuzz import process, fuzz
+    FUZZY_MATCHING_AVAILABLE = True
+except ImportError:
+    FUZZY_MATCHING_AVAILABLE = False
+    # print("[INFO] RapidFuzz not installed.")
+
 # --- Application Configuration & Setup ---
 try:
     from config import DB_PATH, AUDIO_FILES_STORAGE_ROOT_ABS_PATH, BASE_APP_DATA_DIR
@@ -25,350 +41,17 @@ except ImportError:
     print("Please ensure config.py exists and defines DB_PATH, AUDIO_FILES_STORAGE_ROOT_ABS_PATH, BASE_APP_DATA_DIR.")
     sys.exit(1)
 
-def run_full_pipeline(url: str, force: bool):
-    """
-    Execute the complete analysis pipeline in a single run, streaming UI updates progressively.
-    
-    Args:
-        url: YouTube URL to analyze
-        force: Whether to force reprocessing if the video already exists
-    
-    Returns:
-        Dictionary with important results (video_id, segments data, etc.)
-    """
-    # Setup status placeholders
-    status_placeholder = st.empty()
-    progress_bar_placeholder = st.empty()
-    
-    # Create tabs immediately
-    tabs = st.tabs(["전체 스크립트", "구문 분석", "한자", "전체 텍스트", "JSON 데이터"])
-    tab1, tab2, tab3, tab4, tab5 = tabs
-    
-    status_placeholder.info("1단계: 초기화 및 다운로드 중...")
-    progress_bar_placeholder.progress(0.05)
-    
-    conn = get_db_connection()
-    if conn is None:
-        status_placeholder.error("DB 연결 실패.")
-        return None
-    
+# --- Database Connection ---
+def get_db_connection():
     try:
-        # STAGE 1: Initialize and Download
-        cursor = conn.cursor()
-        cursor.execute("SELECT id, video_title, video_data_directory FROM Videos WHERE youtube_url = ?", (url,))
-        existing_video = cursor.fetchone()
-
-        if existing_video and force:
-            status_placeholder.info(f"강제 재처리: '{existing_video['video_title']}' 기존 데이터 삭제 중...")
-            try:
-                if existing_video["video_data_directory"]:
-                    shutil.rmtree(AUDIO_FILES_STORAGE_ROOT_ABS_PATH / existing_video["video_data_directory"], ignore_errors=True)
-                cursor.execute("DELETE FROM Videos WHERE id = ?", (existing_video["id"],)) # Relies on ON DELETE CASCADE
-                conn.commit()
-            except Exception as e_del:
-                status_placeholder.error(f"삭제 오류: {e_del}")
-                return None
-            existing_video = None
-        elif existing_video and not force:
-            status_placeholder.success(f"'{existing_video['video_title']}' 영상은 이미 분석되었습니다. 결과를 표시합니다.")
-            video_id = existing_video["id"]
-            video_dir_name = existing_video["video_data_directory"]
-            video_info = conn.execute("SELECT full_slowed_audio_path, full_transcript_text, raw_deepgram_response_json, full_words_for_sync_json FROM Videos WHERE id = ?", (video_id,)).fetchone()
-            
-            # Fill tab 1: Full transcript
-            if video_info and video_info["full_slowed_audio_path"] and video_info["full_words_for_sync_json"]:
-                full_words_for_sync = json.loads(video_info["full_words_for_sync_json"])
-                full_audio_path = AUDIO_FILES_STORAGE_ROOT_ABS_PATH / video_dir_name / video_info["full_slowed_audio_path"]
-                with tab1:
-                    create_synchronized_player(str(full_audio_path), full_words_for_sync)
-            
-            # Fill tab 2: Analysis
-            with tab2:
-                seg_container = st.container()
-                segments = conn.execute("SELECT id, segment_index, text, start_time, end_time, deepgram_segment_words_json FROM Segments WHERE video_id = ? ORDER BY segment_index", (video_id,)).fetchall()
-                
-                for segment in segments:
-                    segment_id = segment["id"]
-                    phrase_analyses = conn.execute("SELECT gpt_phrase_json, phrase_slowed_audio_path, phrase_words_for_sync_json FROM GptPhraseAnalyses WHERE segment_id = ? ORDER BY phrase_index_in_segment", (segment_id,)).fetchall()
-                    
-                    if phrase_analyses:
-                        # Recreate analysis data structure
-                        gpt_json = {"phrases": []}
-                        phrase_audio_map = {}
-                        
-                        for i, phrase in enumerate(phrase_analyses):
-                            gpt_phrase = json.loads(phrase["gpt_phrase_json"])
-                            gpt_json["phrases"].append(gpt_phrase)
-                            phrase_audio_map[i] = phrase["phrase_slowed_audio_path"]
-                        
-                        segment_analysis = {"gpt_json": gpt_json, "phrase_audio_map": phrase_audio_map}
-                        html = generate_breakdown_html_from_session_state(segment_analysis, video_dir_name, segment_id)
-                        seg_container.components.v1.html(html, height=max(150, len(gpt_json["phrases"]) * 400), scrolling=True)
-                        seg_container.markdown("<hr style='border-top:1.5px solid #ddd; margin-top:20px; margin-bottom:20px'>", unsafe_allow_html=True)
-            
-            # Fill tab 3: Kanji
-            with tab3:
-                kanji_entries = conn.execute("SELECT character, reading, meaning FROM KanjiEntries WHERE video_id = ?", (video_id,)).fetchall()
-                if kanji_entries:
-                    sorted_kanji_items = sorted(kanji_entries, key=lambda x: x['character'])
-                    num_columns = 2
-                    cols = st.columns(num_columns)
-                    st.markdown('<div class="kanji-card-container">', unsafe_allow_html=True)
-                    for idx, kanji_info in enumerate(sorted_kanji_items):
-                        with cols[idx % num_columns]:
-                            k_desc, h_mean = "", ""
-                            original_meaning = kanji_info["meaning"]
-                            parts = []
-                            if " / " in original_meaning:
-                                parts = original_meaning.split(" / ", 1)
-                                k_desc = parts[0]
-                            if len(parts) > 1 and len(parts[1]) > 0:
-                                h_mean = parts[1]
-                            else:
-                                k_desc = original_meaning
-                            html_c = f"""<div class="kanji-card"><div class="kanji-char-display">{kanji_info['character']}</div><div class="kanji-info"><div class="reading"><strong>Reading:</strong> <span class="value">{kanji_info['reading']}</span></div><div class="meaning-korean"><strong>Korean:</strong> <span class="value">{k_desc}</span></div>{'<div class="meaning-hanja"><strong>Hanja:</strong> <span class="value">' + h_mean + '</span></div>' if h_mean else ''}</div></div>"""
-                            st.markdown(html_c, unsafe_allow_html=True)
-                    st.markdown('</div>', unsafe_allow_html=True)
-            
-            # Fill tab 4: Full text
-            with tab4:
-                if video_info and video_info["full_transcript_text"]:
-                    st.text_area("전체 텍스트", video_info["full_transcript_text"], height=300)
-            
-            # Fill tab 5: JSON data
-            with tab5:
-                if video_info and video_info["raw_deepgram_response_json"]:
-                    st.json(json.loads(video_info["raw_deepgram_response_json"]))
-            
-            # Save results to session state
-            st.session_state["last_video_id"] = video_id
-            
-            return {
-                "video_id": video_id,
-                "video_title": existing_video["video_title"]
-            }
-        
-        # Create a temporary directory for download
-        temp_dl_dir_obj = tempfile.TemporaryDirectory(prefix="yt_dl_sess_")
-        temp_dl_dir_path = Path(temp_dl_dir_obj.name)
-        
-        # Download audio
-        downloaded_audio_path, video_title = download_audio(url, temp_dl_dir_path)
-        if not downloaded_audio_path:
-            status_placeholder.error("오디오 다운로드 실패.")
-            return None
-        
-        # Insert video record
-        cursor.execute("INSERT INTO Videos (youtube_url, video_title) VALUES (?, ?)", (url, video_title))
-        conn.commit()
-        video_id = cursor.lastrowid
-        
-        # Create video directory
-        video_dir_name = f"video_{video_id}"
-        video_dir_abs_path = AUDIO_FILES_STORAGE_ROOT_ABS_PATH / video_dir_name
-        (video_dir_abs_path / "phrases").mkdir(parents=True, exist_ok=True)
-        cursor.execute("UPDATE Videos SET video_data_directory = ? WHERE id = ?", (video_dir_name, video_id))
-        
-        # Slow down full audio
-        slowed_full_audio_name = f"full_slowed_{video_id}.mp3"
-        full_slowed_audio_abs_path = str(video_dir_abs_path / slowed_full_audio_name)
-        slow_down_audio(downloaded_audio_path, full_slowed_audio_abs_path)
-        cursor.execute("UPDATE Videos SET full_slowed_audio_path = ? WHERE id = ?", (slowed_full_audio_name, video_id))
-        
-        # Update progress
-        status_placeholder.info("음성 변환 완료. 스크립트 변환 중...")
-        progress_bar_placeholder.progress(0.2)
-        
-        # Transcribe audio
-        transcript_data = transcribe_audio(downloaded_audio_path)
-        if not transcript_data:
-            status_placeholder.error("스크립트 변환 실패.")
-            return None
-        
-        # Process transcript data
-        status_placeholder.info("스크립트 처리 중...")
-        progress_bar_placeholder.progress(0.3)
-        
-        full_transcript, segments_list = prepare_japanese_segments(transcript_data)
-        if full_transcript is None:
-            status_placeholder.error("세그먼트 준비 실패.")
-            return None
-        
-        # Extract words for sync
-        sync_words = extract_words_for_sync(transcript_data)
-        
-        # Update database
-        cursor.execute("UPDATE Videos SET raw_deepgram_response_json = ?, full_transcript_text = ?, full_words_for_sync_json = ? WHERE id = ?",
-                      (json.dumps(transcript_data), full_transcript, json.dumps(sync_words), video_id))
-        
-        # Create segment records
-        segment_db_data = []
-        for seg_idx, seg_detail in enumerate(segments_list):
-            cursor.execute("""INSERT INTO Segments (video_id, segment_index, text, start_time, end_time, deepgram_segment_words_json) 
-                           VALUES (?, ?, ?, ?, ?, ?)""", 
-                           (video_id, seg_idx, seg_detail['text'], seg_detail['start'], seg_detail['end'], 
-                            json.dumps(seg_detail['words'])))
-            seg_detail['db_id'] = cursor.lastrowid
-            segment_db_data.append(seg_detail)
-        conn.commit()
-        
-        # Populate Tab 1 with full audio player
-        with tab1:
-            create_synchronized_player(full_slowed_audio_abs_path, sync_words)
-        
-        # Populate Tab 4 with full text
-        with tab4:
-            st.text_area("전체 텍스트", full_transcript, height=300)
-        
-        # Populate Tab 5 with JSON data
-        with tab5:
-            st.json(transcript_data)
-        
-        # STAGE 2: Analyze segments with GPT
-        status_placeholder.info("구문 분석 시작...")
-        progress_bar_placeholder.progress(0.4)
-        
-        # Create a container for segments in Tab 2
-        with tab2:
-            segments_container = st.container()
-            
-        # Process each segment
-        segment_analyses = {}
-        total_segments = len(segment_db_data)
-        
-        for i, segment in enumerate(segment_db_data):
-            segment_progress = 0.4 + (0.5 * (i / total_segments))
-            status_placeholder.info(f"세그먼트 {i + 1}/{total_segments} GPT 분석 중...")
-            progress_bar_placeholder.progress(segment_progress)
-            
-            # Analyze segment
-            db_segment_id = segment['db_id']
-            gpt_analysis = analyze_japanese_segment(
-                segment['text'], segment['start'], segment['end'], segment['words']
-            )
-            
-            # Process phrases and create audio segments
-            segment_analysis = {"gpt_json": gpt_analysis, "phrase_audio_map": {}}
-            
-            if gpt_analysis and "phrases" in gpt_analysis:
-                gpt_phrases = gpt_analysis.get("phrases", [])
-                phrase_timings = [
-                    (p.get("original_start_time", 0), p.get("original_end_time", 0)) 
-                    for p in gpt_phrases
-                ]
-                phrases_dir = video_dir_abs_path / "phrases"
-                audio_map = create_phrase_audio_segments(
-                    downloaded_audio_path, gpt_phrases, phrase_timings, 
-                    phrases_dir, 0.75, db_segment_id
-                )
-                segment_analysis["phrase_audio_map"] = audio_map
-                
-                # Save phrase data to database
-                for p_idx, p_item in enumerate(gpt_phrases):
-                    p_audio_filename = audio_map.get(p_idx)
-                    p_sync_words = extract_phrase_words_for_sync(
-                        transcript_data, 
-                        p_item.get("original_start_time", 0),
-                        p_item.get("original_end_time", 0)
-                    )
-                    cursor.execute("""
-                    INSERT INTO GptPhraseAnalyses 
-                    (segment_id, phrase_index_in_segment, gpt_phrase_json, phrase_slowed_audio_path, phrase_words_for_sync_json) 
-                    VALUES (?, ?, ?, ?, ?)
-                    """, (
-                        db_segment_id, p_idx, json.dumps(p_item), 
-                        p_audio_filename, json.dumps(p_sync_words)
-                    ))
-            
-            conn.commit()
-            segment_analyses[db_segment_id] = segment_analysis
-            
-            # Generate HTML for this segment and add to UI immediately
-            with segments_container:
-                html = generate_breakdown_html_from_session_state(
-                    segment_analysis, video_dir_name, db_segment_id
-                )
-                num_phrases = len(segment_analysis.get("gpt_json", {}).get("phrases", []))
-                st.components.v1.html(
-                    html, height=max(150, num_phrases * 400), scrolling=True
-                )
-                st.markdown("<hr style='border-top:1.5px solid #ddd; margin-top:20px; margin-bottom:20px'>", 
-                           unsafe_allow_html=True)
-        
-        # STAGE 3: Extract kanji information
-        status_placeholder.info("한자 정보 추출 및 저장 중...")
-        progress_bar_placeholder.progress(0.95)
-        
-        extract_and_store_kanji_for_video(conn, video_id)
-        
-        # Populate Tab 3 with kanji data
-        with tab3:
-            kanji_entries = conn.execute("SELECT character, reading, meaning FROM KanjiEntries WHERE video_id = ?", 
-                                        (video_id,)).fetchall()
-            if kanji_entries:
-                sorted_kanji_items = sorted(kanji_entries, key=lambda x: x['character'])
-                num_columns = 2
-                cols = st.columns(num_columns)
-                st.markdown('<div class="kanji-card-container">', unsafe_allow_html=True)
-                for idx, kanji_info in enumerate(sorted_kanji_items):
-                    with cols[idx % num_columns]:
-                        k_desc, h_mean = "", ""
-                        original_meaning = kanji_info["meaning"]
-                        parts = []
-                        if " / " in original_meaning:
-                            parts = original_meaning.split(" / ", 1)
-                            k_desc = parts[0]
-                        if len(parts) > 1 and len(parts[1]) > 0:
-                            h_mean = parts[1]
-                        else:
-                            k_desc = original_meaning
-                        html_c = f"""<div class="kanji-card"><div class="kanji-char-display">{kanji_info['character']}</div><div class="kanji-info"><div class="reading"><strong>Reading:</strong> <span class="value">{kanji_info['reading']}</span></div><div class="meaning-korean"><strong>Korean:</strong> <span class="value">{k_desc}</span></div>{'<div class="meaning-hanja"><strong>Hanja:</strong> <span class="value">' + h_mean + '</span></div>' if h_mean else ''}</div></div>"""
-                        st.markdown(html_c, unsafe_allow_html=True)
-                st.markdown('</div>', unsafe_allow_html=True)
-        
-        # Cleanup
-        try:
-            temp_dl_dir_obj.cleanup()
-        except Exception:
-            pass
-        
-        # Final status
-        status_placeholder.success("모든 처리 완료!")
-        progress_bar_placeholder.progress(1.0)
-        
-        # Save results to session state
-        st.session_state["last_video_id"] = video_id
-        st.session_state["last_full_transcript"] = full_transcript
-        
-        return {
-            "video_id": video_id,
-            "video_title": video_title,
-            "segment_analyses": segment_analyses
-        }
-        
-    except Exception as e_main_proc:
-        status_placeholder.error(f"주요 처리 오류: {e_main_proc}")
-        print(traceback.format_exc())  # Log full error to console
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        return conn
+    except sqlite3.Error as e:
+        st.error(f"Database connection error: {e}")
         return None
-    finally:
-        if conn:
-            conn.close()
 
-# --- Streamlit App Configuration ---
-#st.set_page_config(layout="wide", page_title="動画分析")
-st.set_page_config(page_title="Japanese")
-
-
-load_dotenv()
-DEEPGRAM_API_KEY = os.getenv('DEEPGRAM_API_KEY')
-OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
-
-try:
-    from rapidfuzz import process, fuzz
-    FUZZY_MATCHING_AVAILABLE = True
-except ImportError:
-    FUZZY_MATCHING_AVAILABLE = False
-
+# OpenAI client setup
 if OPENAI_API_KEY:
     client = OpenAI(api_key=OPENAI_API_KEY)
 else:
@@ -425,21 +108,9 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# --- Database Connection ---
-def get_db_connection():
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
-        return conn
-    except sqlite3.Error as e:
-        st.error(f"Database connection error: {e}")
-        return None
-
-# --- Helper Functions ---
-# (Keep all the helper functions unchanged from the original code)
+# --- Helper Function Definitions ---
 def download_audio(url, output_dir_path: Path):
     output_dir_path.mkdir(parents=True, exist_ok=True)
-    def sanitize_filename(name): return re.sub(r'[\\/*?:"<>|]', "", name)[:100]
     ydl_opts = {
         'format': 'bestaudio/best', 'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '192'}],
         'outtmpl': str(output_dir_path / '%(title)s.%(ext)s'), 'verbose': False, 'noplaylist': True,
@@ -1104,20 +775,14 @@ def generate_breakdown_html_from_session_state(segment_analysis_data: dict, vide
     html_parts = []
     video_specific_audio_root = AUDIO_FILES_STORAGE_ROOT_ABS_PATH / video_data_dir_name
     
-    # Get raw transcript data from database instead of session_state
+    # Get raw transcript data from database
     conn = get_db_connection()
+    raw_transcript_data = {}
     if conn:
-        segment = conn.execute("SELECT s.deepgram_segment_words_json, v.raw_deepgram_response_json FROM Segments s JOIN Videos v ON s.video_id = v.id WHERE s.id = ?", (db_segment_id_for_player,)).fetchone()
+        segment = conn.execute("SELECT v.raw_deepgram_response_json FROM Segments s JOIN Videos v ON s.video_id = v.id WHERE s.id = ?", (db_segment_id_for_player,)).fetchone()
         if segment:
-            segment_words = json.loads(segment["deepgram_segment_words_json"])
             raw_transcript_data = json.loads(segment["raw_deepgram_response_json"])
-        else:
-            segment_words = []
-            raw_transcript_data = {}
         conn.close()
-    else:
-        segment_words = []
-        raw_transcript_data = {}
 
     for phrase_idx, gpt_phrase_detail in enumerate(gpt_json.get("phrases", [])):
         phrase_html = ""
@@ -1183,6 +848,338 @@ def extract_and_store_kanji_for_video(conn, video_id):
         except sqlite3.IntegrityError: pass
     conn.commit()
 
+def run_full_pipeline(url: str, force: bool):
+    """
+    Execute the complete analysis pipeline in a single run, streaming UI updates progressively.
+    
+    Args:
+        url: YouTube URL to analyze
+        force: Whether to force reprocessing if the video already exists
+    
+    Returns:
+        Dictionary with important results (video_id, segments data, etc.)
+    """
+    # Setup status placeholders
+    status_placeholder = st.empty()
+    progress_bar_placeholder = st.empty()
+    
+    # Create tabs immediately
+    tabs = st.tabs(["전체 스크립트", "구문 분석", "한자", "전체 텍스트", "JSON 데이터"])
+    tab1, tab2, tab3, tab4, tab5 = tabs
+    
+    status_placeholder.info("1단계: 초기화 및 다운로드 중...")
+    progress_bar_placeholder.progress(0.05)
+    
+    conn = get_db_connection()
+    if conn is None:
+        status_placeholder.error("DB 연결 실패.")
+        return None
+    
+    # Temporary directory for download
+    temp_dl_dir_obj = None
+    
+    try:
+        # STAGE 1: Initialize and Download
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, video_title, video_data_directory FROM Videos WHERE youtube_url = ?", (url,))
+        existing_video = cursor.fetchone()
+
+        if existing_video and force:
+            status_placeholder.info(f"재처리")
+            try:
+                if existing_video["video_data_directory"]:
+                    shutil.rmtree(AUDIO_FILES_STORAGE_ROOT_ABS_PATH / existing_video["video_data_directory"], ignore_errors=True)
+                cursor.execute("DELETE FROM Videos WHERE id = ?", (existing_video["id"],)) # Relies on ON DELETE CASCADE
+                conn.commit()
+            except Exception as e_del:
+                status_placeholder.error(f"삭제 오류: {e_del}")
+                return None
+            existing_video = None
+        elif existing_video and not force:
+            status_placeholder.success(f"'{existing_video['video_title']}' 영상은 이미 분석되었습니다. 결과를 표시합니다.")
+            video_id = existing_video["id"]
+            video_dir_name = existing_video["video_data_directory"]
+            video_info = conn.execute("SELECT full_slowed_audio_path, full_transcript_text, raw_deepgram_response_json, full_words_for_sync_json FROM Videos WHERE id = ?", (video_id,)).fetchone()
+            
+            # Fill tab 1: Full transcript
+            if video_info and video_info["full_slowed_audio_path"] and video_info["full_words_for_sync_json"]:
+                full_words_for_sync = json.loads(video_info["full_words_for_sync_json"])
+                full_audio_path = AUDIO_FILES_STORAGE_ROOT_ABS_PATH / video_dir_name / video_info["full_slowed_audio_path"]
+                with tab1:
+                    create_synchronized_player(str(full_audio_path), full_words_for_sync)
+            
+            # Fill tab 2: Analysis
+            with tab2:
+                seg_container = st.container()
+                segments = conn.execute("SELECT id, segment_index, text, start_time, end_time, deepgram_segment_words_json FROM Segments WHERE video_id = ? ORDER BY segment_index", (video_id,)).fetchall()
+                
+                for segment in segments:
+                    segment_id = segment["id"]
+                    phrase_analyses = conn.execute("SELECT gpt_phrase_json, phrase_slowed_audio_path, phrase_words_for_sync_json FROM GptPhraseAnalyses WHERE segment_id = ? ORDER BY phrase_index_in_segment", (segment_id,)).fetchall()
+                    
+                    if phrase_analyses:
+                        # Recreate analysis data structure
+                        gpt_json = {"phrases": []}
+                        phrase_audio_map = {}
+                        
+                        for i, phrase in enumerate(phrase_analyses):
+                            gpt_phrase = json.loads(phrase["gpt_phrase_json"])
+                            gpt_json["phrases"].append(gpt_phrase)
+                            phrase_audio_map[i] = phrase["phrase_slowed_audio_path"]
+                        
+                        segment_analysis = {"gpt_json": gpt_json, "phrase_audio_map": phrase_audio_map}
+                        html = generate_breakdown_html_from_session_state(segment_analysis, video_dir_name, segment_id)
+                        with seg_container:
+                            st.components.v1.html(html, height=max(150, len(gpt_json["phrases"]) * 400), scrolling=True)
+                            st.markdown("<hr style='border-top:1.5px solid #ddd; margin-top:20px; margin-bottom:20px'>", unsafe_allow_html=True)
+            
+            # Fill tab 3: Kanji
+            with tab3:
+                kanji_entries = conn.execute("SELECT character, reading, meaning FROM KanjiEntries WHERE video_id = ?", (video_id,)).fetchall()
+                if kanji_entries:
+                    sorted_kanji_items = sorted(kanji_entries, key=lambda x: x['character'])
+                    num_columns = 2
+                    cols = st.columns(num_columns)
+                    st.markdown('<div class="kanji-card-container">', unsafe_allow_html=True)
+                    for idx, kanji_info in enumerate(sorted_kanji_items):
+                        with cols[idx % num_columns]:
+                            k_desc, h_mean = "", ""
+                            original_meaning = kanji_info["meaning"]
+                            parts = []
+                            if " / " in original_meaning:
+                                parts = original_meaning.split(" / ", 1)
+                                k_desc = parts[0]
+                            if len(parts) > 1 and len(parts[1]) > 0:
+                                h_mean = parts[1]
+                            else:
+                                k_desc = original_meaning
+                            html_c = f"""<div class="kanji-card"><div class="kanji-char-display">{kanji_info['character']}</div><div class="kanji-info"><div class="reading"><strong>Reading:</strong> <span class="value">{kanji_info['reading']}</span></div><div class="meaning-korean"><strong>Korean:</strong> <span class="value">{k_desc}</span></div>{'<div class="meaning-hanja"><strong>Hanja:</strong> <span class="value">' + h_mean + '</span></div>' if h_mean else ''}</div></div>"""
+                            st.markdown(html_c, unsafe_allow_html=True)
+                    st.markdown('</div>', unsafe_allow_html=True)
+            
+            # Fill tab 4: Full text
+            with tab4:
+                if video_info and video_info["full_transcript_text"]:
+                    st.text_area("전체 텍스트", video_info["full_transcript_text"], height=300)
+            
+            # Fill tab 5: JSON data
+            with tab5:
+                if video_info and video_info["raw_deepgram_response_json"]:
+                    st.json(json.loads(video_info["raw_deepgram_response_json"]))
+            
+            # Save results to session state
+            st.session_state["last_video_id"] = video_id
+            
+            return {
+                "video_id": video_id,
+                "video_title": existing_video["video_title"]
+            }
+        
+        # Create a temporary directory for download
+        temp_dl_dir_obj = tempfile.TemporaryDirectory(prefix="yt_dl_sess_")
+        temp_dl_dir_path = Path(temp_dl_dir_obj.name)
+        
+        # Download audio
+        downloaded_audio_path, video_title = download_audio(url, temp_dl_dir_path)
+        if not downloaded_audio_path:
+            status_placeholder.error("오디오 다운로드 실패.")
+            return None
+        
+        # Insert video record
+        cursor.execute("INSERT INTO Videos (youtube_url, video_title) VALUES (?, ?)", (url, video_title))
+        conn.commit()
+        video_id = cursor.lastrowid
+        
+        # Create video directory
+        video_dir_name = f"video_{video_id}"
+        video_dir_abs_path = AUDIO_FILES_STORAGE_ROOT_ABS_PATH / video_dir_name
+        (video_dir_abs_path / "phrases").mkdir(parents=True, exist_ok=True)
+        cursor.execute("UPDATE Videos SET video_data_directory = ? WHERE id = ?", (video_dir_name, video_id))
+        
+        # Slow down full audio
+        slowed_full_audio_name = f"full_slowed_{video_id}.mp3"
+        full_slowed_audio_abs_path = str(video_dir_abs_path / slowed_full_audio_name)
+        slow_down_audio(downloaded_audio_path, full_slowed_audio_abs_path)
+        cursor.execute("UPDATE Videos SET full_slowed_audio_path = ? WHERE id = ?", (slowed_full_audio_name, video_id))
+        
+        # Update progress
+        progress_bar_placeholder.progress(0.2)
+        status_placeholder.info("음성 변환 완료. 스크립트 변환 중...")
+        
+        # Transcribe audio
+        transcript_data = transcribe_audio(downloaded_audio_path)
+        if not transcript_data:
+            status_placeholder.error("스크립트 변환 실패.")
+            return None
+        
+        # Process transcript data
+        progress_bar_placeholder.progress(0.3)
+        status_placeholder.info("스크립트 처리 중...")
+        
+        full_transcript, segments_list = prepare_japanese_segments(transcript_data)
+        if full_transcript is None:
+            status_placeholder.error("세그먼트 준비 실패.")
+            return None
+        
+        # Extract words for sync
+        sync_words = extract_words_for_sync(transcript_data)
+        
+        # Update database
+        cursor.execute("UPDATE Videos SET raw_deepgram_response_json = ?, full_transcript_text = ?, full_words_for_sync_json = ? WHERE id = ?",
+                      (json.dumps(transcript_data), full_transcript, json.dumps(sync_words), video_id))
+        
+        # Create segment records
+        segment_db_data = []
+        for seg_idx, seg_detail in enumerate(segments_list):
+            cursor.execute("""INSERT INTO Segments (video_id, segment_index, text, start_time, end_time, deepgram_segment_words_json) 
+                           VALUES (?, ?, ?, ?, ?, ?)""", 
+                           (video_id, seg_idx, seg_detail['text'], seg_detail['start'], seg_detail['end'], 
+                            json.dumps(seg_detail['words'])))
+            seg_detail['db_id'] = cursor.lastrowid
+            segment_db_data.append(seg_detail)
+        conn.commit()
+        
+        # Populate Tab 1 with full audio player
+        with tab1:
+            create_synchronized_player(full_slowed_audio_abs_path, sync_words)
+        
+        # Populate Tab 4 with full text
+        with tab4:
+            st.text_area("전체 텍스트", full_transcript, height=300)
+        
+        # Populate Tab 5 with JSON data
+        with tab5:
+            st.json(transcript_data)
+        
+        # STAGE 2: Analyze segments with GPT
+        status_placeholder.info("구문 분석 시작...")
+        progress_bar_placeholder.progress(0.4)
+        
+        # Create a container for segments in Tab 2
+        with tab2:
+            segments_container = st.container()
+            
+        # Process each segment
+        segment_analyses = {}
+        total_segments = len(segment_db_data)
+        
+        for i, segment in enumerate(segment_db_data):
+            segment_progress = 0.4 + (0.5 * ((i+1) / total_segments))  # Fixed to reach 0.9 at the end
+            status_placeholder.info(f"세그먼트 {i + 1}/{total_segments} GPT 분석 중...")
+            progress_bar_placeholder.progress(segment_progress)
+            
+            # Analyze segment
+            db_segment_id = segment['db_id']
+            gpt_analysis = analyze_japanese_segment(
+                segment['text'], segment['start'], segment['end'], segment['words']
+            )
+            
+            # Process phrases and create audio segments
+            segment_analysis = {"gpt_json": gpt_analysis, "phrase_audio_map": {}}
+            
+            if gpt_analysis and "phrases" in gpt_analysis:
+                gpt_phrases = gpt_analysis.get("phrases", [])
+                phrase_timings = [
+                    (p.get("original_start_time", 0), p.get("original_end_time", 0)) 
+                    for p in gpt_phrases
+                ]
+                phrases_dir = video_dir_abs_path / "phrases"
+                audio_map = create_phrase_audio_segments(
+                    downloaded_audio_path, gpt_phrases, phrase_timings, 
+                    phrases_dir, 0.75, db_segment_id
+                )
+                segment_analysis["phrase_audio_map"] = audio_map
+                
+                # Save phrase data to database
+                for p_idx, p_item in enumerate(gpt_phrases):
+                    p_audio_filename = audio_map.get(p_idx)
+                    p_sync_words = extract_phrase_words_for_sync(
+                        transcript_data, 
+                        p_item.get("original_start_time", 0),
+                        p_item.get("original_end_time", 0)
+                    )
+                    cursor.execute("""
+                    INSERT INTO GptPhraseAnalyses 
+                    (segment_id, phrase_index_in_segment, gpt_phrase_json, phrase_slowed_audio_path, phrase_words_for_sync_json) 
+                    VALUES (?, ?, ?, ?, ?)
+                    """, (
+                        db_segment_id, p_idx, json.dumps(p_item), 
+                        p_audio_filename, json.dumps(p_sync_words)
+                    ))
+            
+            conn.commit()
+            segment_analyses[db_segment_id] = segment_analysis
+            
+            # Generate HTML for this segment and add to UI immediately
+            with segments_container:
+                html = generate_breakdown_html_from_session_state(
+                    segment_analysis, video_dir_name, db_segment_id
+                )
+                num_phrases = len(segment_analysis.get("gpt_json", {}).get("phrases", []))
+                st.components.v1.html(
+                    html, height=max(150, num_phrases * 400), scrolling=True
+                )
+                st.markdown("<hr style='border-top:1.5px solid #ddd; margin-top:20px; margin-bottom:20px'>", 
+                           unsafe_allow_html=True)
+        
+        # STAGE 3: Extract kanji information
+        status_placeholder.info("한자 정보 추출 및 저장 중...")
+        progress_bar_placeholder.progress(0.95)
+        
+        extract_and_store_kanji_for_video(conn, video_id)
+        
+        # Populate Tab 3 with kanji data
+        with tab3:
+            kanji_entries = conn.execute("SELECT character, reading, meaning FROM KanjiEntries WHERE video_id = ?", 
+                                        (video_id,)).fetchall()
+            if kanji_entries:
+                sorted_kanji_items = sorted(kanji_entries, key=lambda x: x['character'])
+                num_columns = 2
+                cols = st.columns(num_columns)
+                st.markdown('<div class="kanji-card-container">', unsafe_allow_html=True)
+                for idx, kanji_info in enumerate(sorted_kanji_items):
+                    with cols[idx % num_columns]:
+                        k_desc, h_mean = "", ""
+                        original_meaning = kanji_info["meaning"]
+                        parts = []
+                        if " / " in original_meaning:
+                            parts = original_meaning.split(" / ", 1)
+                            k_desc = parts[0]
+                        if len(parts) > 1 and len(parts[1]) > 0:
+                            h_mean = parts[1]
+                        else:
+                            k_desc = original_meaning
+                        html_c = f"""<div class="kanji-card"><div class="kanji-char-display">{kanji_info['character']}</div><div class="kanji-info"><div class="reading"><strong>Reading:</strong> <span class="value">{kanji_info['reading']}</span></div><div class="meaning-korean"><strong>Korean:</strong> <span class="value">{k_desc}</span></div>{'<div class="meaning-hanja"><strong>Hanja:</strong> <span class="value">' + h_mean + '</span></div>' if h_mean else ''}</div></div>"""
+                        st.markdown(html_c, unsafe_allow_html=True)
+                st.markdown('</div>', unsafe_allow_html=True)
+        
+        # Final status
+        status_placeholder.success("모든 처리 완료!")
+        progress_bar_placeholder.progress(1.0)
+        
+        # Save results to session state
+        st.session_state["last_video_id"] = video_id
+        st.session_state["last_full_transcript"] = full_transcript
+        
+        return {
+            "video_id": video_id,
+            "video_title": video_title,
+            "segment_analyses": segment_analyses
+        }
+    except Exception as e_main_proc:
+        status_placeholder.error(f"주요 처리 오류: {e_main_proc}")
+        print(traceback.format_exc())  # Log full error to console
+        return None
+    finally:
+        if conn:
+            conn.close()
+        # Clean up temporary directory
+        if temp_dl_dir_obj:
+            try:
+                temp_dl_dir_obj.cleanup()
+            except Exception as e_cleanup:
+                print(f"Temp directory cleanup error: {e_cleanup}")  # Log cleanup errors
+
 # --- Main Streamlit App UI ---
 st.title("🇯🇵")
 
@@ -1193,13 +1190,13 @@ st.sidebar.markdown(f"OpenAI API: {'✅' if OPENAI_API_KEY else '❌'}")
 st.sidebar.markdown(f"Deepgram API: {'✅' if DEEPGRAM_API_KEY else '❌'}")
 
 youtube_url_input = st.text_input("YouTube URL:", placeholder="여기에 URL을 입력하세요...")
-force_reprocess_checkbox = st.checkbox("재처리")
+force_reprocess_checkbox = st.checkbox("강제 재처리 (이미 분석된 영상일 경우)")
 
 analyze_button = st.button("분석 시작")
 
 if analyze_button:
     if not youtube_url_input.strip():
-        st.warning("YouTube URL을 입력ouTube 분해주세요.")
+        st.warning("YouTube URL을 입력해주세요.")
     elif not (OPENAI_API_KEY and DEEPGRAM_API_KEY):
         st.warning("API 키가 누락되었습니다.")
     else:
