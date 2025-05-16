@@ -377,32 +377,25 @@ Your JSON should look similar to:
       "meaning": "대표단은"
     },
     {
-      "number": 3,
-      "text": "2022年の停戦交渉に",
-      "words": [
+    "number": 3,
+    "text": "2022年の停戦交渉にあたった",
+    "words": [
         {"japanese": "2022年", "kanji": "年", "romaji": "nisen nijūni nen", "meaning": "2022년"},
         {"japanese": "の", "kanji": "", "romaji": "no", "meaning": "~의"},
         {"japanese": "停戦交渉", "kanji": "停戦交渉", "romaji": "teisen kōshō", "meaning": "정전교섭"},
-        {"japanese": "に", "kanji": "", "romaji": "ni", "meaning": "~에"}
-      ],
-      "kanji_explanations": [
+        {"japanese": "に", "kanji": "", "romaji": "ni", "meaning": "~에"},
+        {"japanese": "あたった", "kanji": "", "romaji": "atatta", "meaning": "임했다, 담당했다 (当たる의 과거형)"}
+    ],
+    "kanji_explanations": [
         {"kanji": "年", "reading": "ねん", "meaning": "해 / 년"},
         {"kanji": "停", "reading": "てい", "meaning": "머무를 / 정"},
         {"kanji": "戦", "reading": "せん", "meaning": "싸울 / 전"},
         {"kanji": "交", "reading": "こう", "meaning": "사귈 / 교"},
         {"kanji": "渉", "reading": "しょう", "meaning": "건널 / 섭"}
-      ],
-      "meaning": "2022년의 정전교섭에"
-    },
-    {
-      "number": 4,
-      "text": "あたった",
-      "words": [
-        {"japanese": "あたった", "kanji": "", "romaji": "atatta", "meaning": "임했다, 담당했다 (当たる의 과거형)"}
-      ],
-      "kanji_explanations": [],
-      "meaning": "임했다"
+    ],
+    "meaning": "2022년의 정전교섭에 임했다"
     }
+    ...continue
   ]
 }
 Ensure your JSON is well-formed and follows this exact structure. Provide ONLY the JSON object as the response.
@@ -848,32 +841,753 @@ def extract_and_store_kanji_for_video(conn, video_id):
         except sqlite3.IntegrityError: pass
     conn.commit()
 
-# Add a new helper function to collect vocabulary with kanji
-def collect_vocab_with_kanji(gpt_json, vocab_map):
+# ─────────────────────────────────────────────────────────────
+#  Kanji-to-timing mapper (final version with absolute offset)
+# ─────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────
+#  Final timing-aware vocabulary collector
+# ──────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────
+def collect_vocab_with_kanji(gpt_json, vocab_map, phrase_sync_words=None):
     """
-    Mutates `vocab_map` (dict keyed by 일본어) with any words in `gpt_json`
-    whose kanji field is non-empty.
+    Insert / update kanji words from GPT analysis, *with real timings*.
+    Works for compounds up to 8 tokens and tolerates small string noise.
     """
     if not gpt_json or "phrases" not in gpt_json:
         return
 
-    for phrase in gpt_json["phrases"]:
-        for w in phrase.get("words", []):
-            if w.get("kanji"):
-                jp = w.get("japanese", "")
-                if jp and jp not in vocab_map:  # keep first occurrence
-                    # Find kanji readings from kanji_explanations
-                    kanji_readings = {}
-                    for k_exp in phrase.get("kanji_explanations", []):
-                        if k_exp.get("kanji") and k_exp.get("reading"):
-                            kanji_readings[k_exp.get("kanji")] = k_exp.get("reading")
-                    
-                    vocab_map[jp] = {
-                        "kanji": w.get("kanji", ""),
-                        "romaji": w.get("romaji", ""),
-                        "meaning": w.get("meaning", ""),
-                        "kanji_readings": kanji_readings  # Store readings for furigana display
+    # small util — same normaliser for BOTH sides
+    _full2half = str.maketrans("０１２３４５６７８９", "0123456789")
+    def _norm(txt: str) -> str:
+        return normalize_japanese(txt).translate(_full2half)
+
+    for phr in gpt_json["phrases"]:
+        # ------------------------------------------------------------------
+        # Build token-window lookup once per phrase
+        # ------------------------------------------------------------------
+        lookup = {}                              # key → (abs_start, abs_end)
+        if phrase_sync_words:                    # already speed-adjusted list
+            off = phr.get("original_start_time", 0) or 0        # <-- original units
+
+            # ------------------------------------------------------------------
+            # replace with slowed-audio offset (same transform you used earlier)
+            # ------------------------------------------------------------------
+            adj = 1 / 0.75                  # <- or pass speed_factor in
+            time_off = 0.3
+            off = phr.get("original_start_time", 0) * adj - time_off
+            toks = phrase_sync_words
+            n = len(toks)
+
+            # single tokens first
+            for t in toks:
+                lookup[_norm(t["text"])] = (t["start"] + off, t["end"] + off)
+
+            # n-grams 2-…-8  (ニュー/タ/バル/基/地  → ニュータバル基地)
+            for span in range(2, min(9, n + 1)):
+                for i in range(n - span + 1):
+                    win = toks[i : i + span]
+                    key = _norm("".join(t["text"] for t in win))
+                    lookup[key] = (win[0]["start"] + off, win[-1]["end"] + off)
+
+        lkeys = list(lookup.keys())              # cache for fuzzy
+
+        # ------------------------------------------------------------------
+        # Walk GPT words
+        # ------------------------------------------------------------------
+        for w in phr["words"]:
+            if not w.get("kanji"):
+                continue
+
+            surf = w.get("japanese", "")
+            if not surf:
+                continue
+
+            k = _norm(surf)
+            start = end = None
+
+            # 1) exact
+            if k in lookup:
+                start, end = lookup[k]
+
+            # 2) fuzzy (≥90) if RapidFuzz available
+            elif FUZZY_MATCHING_AVAILABLE and lkeys:
+                hit, score, _ = process.extractOne(k, lkeys, scorer=fuzz.ratio)
+                if score >= 90:
+                    start, end = lookup[hit]
+
+            # discard micro-windows (<150 ms) – usually wrong
+            if start is not None and (end - start) < 0.15:
+                start = end = None
+
+            # write / update map
+            if surf not in vocab_map or (
+                start is not None and vocab_map[surf].get("start") is None
+            ):
+                vocab_map[surf] = {
+                    "kanji": w.get("kanji", ""),
+                    "romaji": w.get("romaji", ""),
+                    "meaning": w.get("meaning", ""),
+                    "kanji_readings": {
+                        ke["kanji"]: ke["reading"]
+                        for ke in phr.get("kanji_explanations", [])
+                        if ke.get("kanji") and ke.get("reading")
+                    },
+                    "start": start,
+                    "end": end,
+                }
+
+
+
+
+
+def find_audio_file_for_video(video_id, video_dir_name):
+    """
+    Attempts to find the audio file using multiple methods if the standard path resolution fails.
+    
+    Args:
+        video_id: ID of the video
+        video_dir_name: Name of the video directory
+        
+    Returns:
+        Path to the audio file if found, None otherwise
+    """
+    # Method 1: Check database path
+    try:
+        conn = get_db_connection()
+        if conn:
+            video_info = conn.execute("SELECT full_slowed_audio_path FROM Videos WHERE id = ?", (video_id,)).fetchone()
+            if video_info and video_info["full_slowed_audio_path"]:
+                standard_path = AUDIO_FILES_STORAGE_ROOT_ABS_PATH / video_dir_name / video_info["full_slowed_audio_path"]
+                if os.path.exists(standard_path):
+                    conn.close()
+                    return str(standard_path)
+            conn.close()
+    except Exception:
+        pass
+    
+    # Method 2: Search directly in the video directory for MP3 files
+    try:
+        video_dir = AUDIO_FILES_STORAGE_ROOT_ABS_PATH / video_dir_name
+        if os.path.exists(video_dir):
+            mp3_files = list(video_dir.glob("*.mp3"))
+            if mp3_files:
+                # Prefer files with "full" or "slowed" in the name
+                for keyword in ["full_slowed", "slowed", "full"]:
+                    for file_path in mp3_files:
+                        if keyword in file_path.name.lower():
+                            return str(file_path)
+                
+                # If no keyword match, return the largest MP3 file (likely the full audio)
+                return str(max(mp3_files, key=os.path.getsize))
+    except Exception:
+        pass
+    
+    # Method 3: Check for any MP3 file in storage root as last resort
+    try:
+        if os.path.exists(AUDIO_FILES_STORAGE_ROOT_ABS_PATH):
+            for root, dirs, files in os.walk(AUDIO_FILES_STORAGE_ROOT_ABS_PATH):
+                if video_dir_name in root:  # Only look in directories related to this video
+                    mp3_files = [os.path.join(root, f) for f in files if f.endswith(".mp3")]
+                    if mp3_files:
+                        return max(mp3_files, key=os.path.getsize)
+    except Exception:
+        pass
+    
+    return None
+
+def create_vocab_component(vocab_map, full_slowed_audio_path, filter_query="", sort_by="일본어순"):
+    """
+    Generate a complete self-contained HTML component for vocabulary with proper audio playback.
+    
+    Args:
+        vocab_map: Dictionary of vocabulary words with their details
+        full_slowed_audio_path: Path to the slowed audio file
+        filter_query: Optional filter for vocabulary words
+        sort_by: Sort method ("일본어순" or "한자순")
+        
+    Returns:
+        String containing complete HTML component
+    """
+    # Sort and filter vocabulary items
+    if sort_by == "일본어순":
+        sorted_items = sorted(vocab_map.items())
+    elif sort_by == "한자순":
+        sorted_items = sorted(vocab_map.items(), key=lambda x: x[1]["kanji"])
+    else:                             # 시간순  ← default branch
+        sorted_items = sorted(
+            vocab_map.items(),
+            key=lambda kv: (
+                float("inf") if kv[1]["start"] is None else kv[1]["start"]
+            ),
+        )
+    
+    # Filter based on search query
+    filtered_items = [
+        (jp, info) for jp, info in sorted_items 
+        if not filter_query or (filter_query.lower() in jp.lower() or 
+                               filter_query.lower() in info["meaning"].lower())
+    ]
+    
+    # Complete HTML content with CSS, audio, cards, and JavaScript in ONE component
+    html_content = """
+    <style>
+    /* CSS styles for vocabulary cards */
+    .vocab-card {
+        border: 1px solid #e0e0e0;
+        border-radius: 8px;
+        padding: 20px;
+        margin-bottom: 12px;
+        background-color: #ffffff;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+        transition: box-shadow 0.2s, transform 0.2s;
+        text-align: center;
+        cursor: pointer;
+    }
+    .vocab-card:hover {
+        box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+        transform: translateY(-2px);
+    }
+    .vocab-card.vocab-playing {
+        background-color: #f8f8ff;
+        border-color: #4285f4;
+        box-shadow: 0 4px 12px rgba(66, 133, 244, 0.2);
+    }
+    .vocab-japanese {
+        font-size: 2.2rem;
+        margin-bottom: 16px;
+        color: #2c3e50;
+        font-weight: 500;
+        line-height: 1.4;
+    }
+    .vocab-meaning {
+        font-size: 1.4rem;
+        color: #16a085;
+        font-weight: 500;
+    }
+    rt {
+        font-size: 0.7em;
+        color: #555;
+        opacity: 0.9;
+    }
+    .vocab-grid {
+        display: grid;
+        grid-template-columns: repeat(2, 1fr);
+        gap: 15px;
+        padding: 10px;
+    }
+    .debug-info {
+        color: #999;
+        font-size: 10px;
+        margin-top: 5px;
+    }
+    .control-panel {
+        text-align: center;
+        margin-bottom: 15px;
+        padding: 10px;
+        background: #f8f8f8;
+        border-radius: 8px;
+    }
+    .stop-button {
+        display: inline-block;
+        padding: 6px 12px;
+        background-color: #f44336;
+        color: white;
+        font-size: 14px;
+        border-radius: 4px;
+        margin: 5px;
+        cursor: pointer;
+        border: none;
+    }
+    .play-all-button {
+        display: inline-block;
+        padding: 6px 12px;
+        background-color: #4CAF50;
+        color: white;
+        font-size: 14px;
+        border-radius: 4px;
+        margin: 5px;
+        cursor: pointer;
+        border: none;
+    }
+    .audio-status {
+        display: inline-block;
+        margin-left: 10px;
+        font-size: 14px;
+    }
+    .timing-missing {
+        border: 1px dashed #ff9800 !important;
+    }
+    </style>
+    
+    <div id="debug-output" style="display:none;"></div>
+    
+    <!-- Control panel with status indicator -->
+    <div class="control-panel">
+        <button onclick="stopVocab()" class="stop-button">Stop</button>
+        <span id="audio-status" class="audio-status">Initializing audio...</span>
+    </div>
+    """
+    
+    # Add the audio element with more robust error handling
+    if full_slowed_audio_path and os.path.exists(full_slowed_audio_path):
+        try:
+            with open(full_slowed_audio_path, 'rb') as audio_file:
+                audio_size = os.path.getsize(full_slowed_audio_path)
+                audio_b64 = base64.b64encode(audio_file.read()).decode()
+                html_content += f"""
+                <audio id="vocab-player" preload="auto">
+                    <source src="data:audio/mp3;base64,{audio_b64}" type="audio/mp3">
+                    Your browser does not support the audio element.
+                </audio>
+                <div style="color:green; padding:5px; margin:5px 0; background:#f0fff0; border-radius:4px; display:none;">
+                    Audio file loaded successfully: {os.path.basename(full_slowed_audio_path)} ({audio_size/1024/1024:.2f} MB)
+                </div>
+                """
+        except Exception as e:
+            error_message = str(e)
+            html_content += f"""
+            <div style="color:red; padding:10px; margin-bottom:15px; background:#fff0f0; border-radius:4px;">
+                Audio loading error: {error_message}
+                <div style="font-size:12px; margin-top:5px;">Path: {full_slowed_audio_path}</div>
+            </div>
+            <audio id="vocab-player"></audio>
+            """
+    else:
+        html_content += f"""
+        <div style="color:orange; padding:10px; margin-bottom:15px; background:#fff8e1; border-radius:4px;">
+            No audio file available for this video.
+            <div style="font-size:12px; margin-top:5px;">
+                Path checked: {full_slowed_audio_path if full_slowed_audio_path else "None"}
+                <br>Path exists: {os.path.exists(full_slowed_audio_path) if full_slowed_audio_path else "False"}
+            </div>
+        </div>
+        <audio id="vocab-player"></audio>
+        """
+    
+    # Add vocabulary cards grid with timing data
+    html_content += '<div class="vocab-grid">'
+    
+    for jp, info in filtered_items:
+        # Create furigana HTML for display
+        jp_with_furigana = jp
+        kanji_readings = info.get("kanji_readings", {})
+        if kanji_readings:
+            for kanji, reading in kanji_readings.items():
+                if kanji in jp:
+                    jp_with_furigana = jp_with_furigana.replace(
+                        kanji, 
+                        f'<ruby>{kanji}<rt>{reading}</rt></ruby>'
+                    )
+        
+        # IMPORTANT FIX: Always include data attributes, with defaults if actual timing is missing
+        start_time = info.get("start")
+        end_time = info.get("end")
+        has_timing = start_time is not None and end_time is not None
+        
+        # Include data attributes even if the values are "null" - better for debugging
+        # JavaScript can handle null values, but missing attributes cause more problems
+        start_attr = f'data-start="{start_time}"'
+        end_attr = f'data-end="{end_time}"'
+        
+        # Add a class to visually indicate cards with missing timing
+        timing_class = "" if has_timing else "timing-missing"
+        
+        # Add debug timing display for troubleshooting
+        #debug_timing = f'<div class="debug-info">{start_time}s - {end_time}s</div>' if has_timing else '<div class="debug-info">No timing data</div>'
+        debug_timing = ""
+        html_content += f"""
+        <div class="vocab-card {timing_class}" {start_attr} {end_attr} onclick="playVocab(this)">
+            <div class="vocab-japanese">{jp_with_furigana}</div>
+            <div class="vocab-meaning">{info["meaning"]}</div>
+            {debug_timing}
+        </div>
+        """
+    
+    html_content += '</div>'
+    
+    # Add improved JavaScript with better error handling and debugging
+    html_content += """
+    <script>
+    (function() {
+        // Use let/const for variables to keep them in this closure
+        const player = document.getElementById('vocab-player');
+        const audioStatus = document.getElementById('audio-status');
+        let stopTimeout = null;
+        let currentPlayingCard = null;
+        
+        // Log initial state to help debugging
+        console.log("Audio player on initialization:", player);
+        
+        // Check if player has a source
+        function checkAudioSource() {
+            if (player) {
+                const source = player.querySelector('source');
+                if (source && source.src) {
+                    console.log("Audio source found:", source.src.substring(0, 50) + "...");
+                    return true;
+                } else {
+                    console.warn("Audio element exists but has no source");
+                    return false;
+                }
+            }
+            return false;
+        }
+        
+        // Update status based on player and source
+        if (player) {
+            audioStatus.innerHTML = '<span style="color:green">✓ Audio player found</span>';
+            
+            if (checkAudioSource()) {
+                audioStatus.innerHTML = '<span style="color:green">✓ Audio ready</span>';
+            } else {
+                audioStatus.innerHTML = '<span style="color:orange">⚠️ Audio source missing</span>';
+            }
+            
+            // Set up error handling for the audio element
+            player.addEventListener('error', function(e) {
+                console.error("Audio element error:", e);
+                audioStatus.innerHTML = '<span style="color:red">⚠️ Audio error: ' + 
+                    (player.error ? player.error.message : 'unknown') + '</span>';
+            });
+        } else {
+            console.error("Audio player element not found!");
+            audioStatus.innerHTML = '<span style="color:red">⚠️ Audio player not found!</span>';
+        }
+        
+        window.playVocab = function (card) {
+            console.log("Card clicked:", card);
+            console.log("Audio player when clicked:", player);
+
+            if (!player) {
+                audioStatus.innerHTML =
+                    '<span style="color:red">⚠️ Audio player not available</span>';
+                return;
+            }
+            if (!checkAudioSource()) {
+                audioStatus.innerHTML =
+                    '<span style="color:red">⚠️ No audio source available</span>';
+                return;
+            }
+
+            // ─── ① read raw timings from data-attributes ────────────────────
+            const rawStart = parseFloat(card.dataset.start);
+            const rawEnd   = parseFloat(card.dataset.end);
+            console.log("Raw Start:", rawStart, "Raw End:", rawEnd);
+
+            if (isNaN(rawStart) || isNaN(rawEnd)) {
+                card.style.border = "2px solid orange";
+                audioStatus.innerHTML =
+                    '<span style="color:orange">⚠️ No timing data for this word</span>';
+                setTimeout(() => {
+                    card.style.border = "";
+                    audioStatus.innerHTML = '<span style="color:green">Ready</span>';
+                }, 2000);
+                return;
+            }
+
+            // ─── ② add ± padding (seconds) and clamp inside audio duration ─
+            const EXTRA = 0.8;                                        // adjust here
+            const startTime = rawStart + 0.3;
+            const endTime   = Math.min(
+                (player.duration || rawEnd + EXTRA + 1),            // if metadata not yet loaded
+                rawEnd + EXTRA
+            );
+
+            // ─── ③ highlight card / reset previous ─────────────────────────
+            if (currentPlayingCard) {
+                currentPlayingCard.classList.remove("vocab-playing");
+            }
+            card.classList.add("vocab-playing");
+            currentPlayingCard = card;
+
+            clearTimeout(stopTimeout);                            // cancel old snippet
+
+            try {
+                if (Math.abs(player.currentTime - startTime) > 0.1) {
+                    player.currentTime = startTime;
+                }
+
+                const playPromise = player.play();
+                if (playPromise !== undefined) {
+                    playPromise
+                        .then(() => {
+                            audioStatus.innerHTML =
+                                '<span style="color:blue">▶️ Playing</span>';
+                        })
+                        .catch((error) => {
+                            console.error("Play failed:", error);
+                            audioStatus.innerHTML =
+                                '<span style="color:red">⚠️ Playback failed: ' +
+                                error.message +
+                                "</span>";
+                            card.classList.remove("vocab-playing");
+                        });
+                }
+
+                // ─── ④ schedule pause after padded window finishes ──────────
+                const duration = (endTime - startTime) * 1000;
+                stopTimeout = setTimeout(() => {
+                    player.pause();
+                    if (currentPlayingCard) {
+                        currentPlayingCard.classList.remove("vocab-playing");
+                        currentPlayingCard = null;
                     }
+                    audioStatus.innerHTML = '<span style="color:green">Ready</span>';
+                }, duration + 100); // tiny buffer
+
+            } catch (e) {
+                console.error("Error playing audio:", e);
+                audioStatus.innerHTML =
+                    '<span style="color:red">⚠️ Error: ' + e.message + "</span>";
+                if (currentPlayingCard) {
+                    currentPlayingCard.classList.remove("vocab-playing");
+                }
+            }
+        };
+        
+        // Stop button function
+        window.stopVocab = function() {
+            if (player) {
+                player.pause();
+            }
+            clearTimeout(stopTimeout);
+            
+            if (currentPlayingCard) {
+                currentPlayingCard.classList.remove('vocab-playing');
+                currentPlayingCard = null;
+            }
+            
+            audioStatus.innerHTML = '<span style="color:green">Ready</span>';
+        };
+        
+        // Set audio status when page loads
+        window.addEventListener('load', function() {
+            if (player) {
+                if (checkAudioSource()) {
+                    audioStatus.innerHTML = '<span style="color:green">Ready</span>';
+                }
+            }
+        });
+    })();
+    </script>
+    """
+    
+    # Add diagnostic tools for troubleshooting
+    html_content += """
+    <div style="margin-top: 20px; padding: 10px; border: 1px solid #ddd; background: #f9f9f9; border-radius: 4px;">
+        <label style="display: block; margin-bottom: 10px;">
+            <input type="checkbox" id="toggle-debug" onclick="toggleDebug()"> 
+            Show debugging information
+        </label>
+        <div id="debug-panel" style="display: none; margin-top: 10px;">
+            <h3>Audio Element Debug:</h3>
+            <pre id="audio-debug"></pre>
+            <h3>Timing Data Debug:</h3>
+            <pre id="timing-debug"></pre>
+            <button onclick="testAudio()" style="padding: 5px 10px; background: #4285f4; color: white; border: none; border-radius: 4px; cursor: pointer;">Test Audio</button>
+        </div>
+    </div>
+
+    <script>
+    function toggleDebug() {
+        const debugPanel = document.getElementById('debug-panel');
+        debugPanel.style.display = debugPanel.style.display === 'none' ? 'block' : 'none';
+        
+        if (debugPanel.style.display === 'block') {
+            const audioEl = document.getElementById('vocab-player');
+            document.getElementById('audio-debug').textContent = 
+                'Audio element exists: ' + (audioEl ? 'Yes' : 'No') + '\\n' +
+                'Audio source: ' + (audioEl && audioEl.querySelector('source') ? 
+                                   audioEl.querySelector('source').src.substring(0, 50) + '...' : 'None') + '\\n' +
+                'Ready state: ' + (audioEl ? audioEl.readyState : 'N/A') + '\\n' +
+                'Network state: ' + (audioEl ? audioEl.networkState : 'N/A') + '\\n' +
+                'Paused: ' + (audioEl ? audioEl.paused : 'N/A') + '\\n' +
+                'Duration: ' + (audioEl ? audioEl.duration : 'N/A') + '\\n' +
+                'Error: ' + (audioEl && audioEl.error ? audioEl.error.message : 'None');
+                
+            // Show timing data for cards
+            let timingInfo = '';
+            const cards = document.querySelectorAll('.vocab-card');
+            for (let i = 0; i < Math.min(5, cards.length); i++) {
+                const card = cards[i];
+                const jp = card.querySelector('.vocab-japanese').textContent;
+                timingInfo += `Card ${i+1}: "${jp.substring(0, 10)}..." ` + 
+                              `Start: ${card.dataset.start}, End: ${card.dataset.end}\\n`;
+            }
+            document.getElementById('timing-debug').textContent = timingInfo;
+        }
+    }
+
+    function testAudio() {
+        const audioEl = document.getElementById('vocab-player');
+        if (!audioEl) {
+            alert('Audio element not found!');
+            return;
+        }
+        
+        try {
+            audioEl.currentTime = 0;
+            const playPromise = audioEl.play();
+            if (playPromise !== undefined) {
+                playPromise.then(_ => {
+                    setTimeout(() => {
+                        audioEl.pause();
+                        alert('Audio test successful!');
+                    }, 2000);
+                }).catch(e => {
+                    alert('Audio play error: ' + e);
+                });
+            }
+        } catch (e) {
+            alert('Audio test error: ' + e);
+        }
+    }
+    </script>
+    """
+    
+    return html_content
+
+def populate_vocab_tab(tab_word, vocab_map, video_id, video_dir_name):
+    """
+    Populates the vocabulary tab with an interactive word display.
+    
+    Args:
+        tab_word: Streamlit tab object for the vocabulary tab
+        vocab_map: Dictionary of vocabulary words with their details
+        video_id: ID of the current video
+        video_dir_name: Directory name for the current video data
+    """
+    
+    with tab_word:
+        #st.subheader("📚 단어 (Kanji Vocabulary)")
+        
+        if not vocab_map:
+            st.info("이 영상에 한자가 포함된 단어가 없습니다.")
+        else:
+            # Filter and sort controls
+            col1, col2 = st.columns([3, 1])
+            with col1:
+                filter_key = f"filter_{video_id}"
+                filter_q = st.text_input("검색 / 필터 (일본어 또는 의미로 검색)", "", key=filter_key)
+            with col2:
+                sort_key = f"sort_{video_id}"
+                sort_option = st.selectbox("정렬 기준", ["시간순", "일본어순", "한자순"], key=sort_key)
+            
+            # Add debug output to show path resolution
+            audio_debug_expander = st.expander("", expanded=False)
+            
+            # Get full slowed audio path with better error handling
+            full_slowed_audio_path = None
+            
+            try:
+                conn = get_db_connection()
+                if conn and video_dir_name:
+                    with audio_debug_expander:
+                        st.write(f"Video ID: {video_id}")
+                        st.write(f"Video Directory: {video_dir_name}")
+                        st.write(f"Storage Root: {AUDIO_FILES_STORAGE_ROOT_ABS_PATH}")
+                    
+                    video_info = conn.execute("SELECT full_slowed_audio_path FROM Videos WHERE id = ?", (video_id,)).fetchone()
+                    
+                    if video_info and "full_slowed_audio_path" in video_info and video_info["full_slowed_audio_path"]:
+                        relative_audio_path = video_info["full_slowed_audio_path"]
+                        with audio_debug_expander:
+                            st.write(f"Relative Audio Path: {relative_audio_path}")
+                        
+                        # Construct full path
+                        full_slowed_audio_path = str(AUDIO_FILES_STORAGE_ROOT_ABS_PATH / video_dir_name / relative_audio_path)
+                        
+                        with audio_debug_expander:
+                            st.write(f"Full Audio Path: {full_slowed_audio_path}")
+                            st.write(f"File exists: {os.path.exists(full_slowed_audio_path)}")
+                            
+                            # If file doesn't exist, check parent directory
+                            if not os.path.exists(full_slowed_audio_path):
+                                parent_dir = os.path.dirname(full_slowed_audio_path)
+                                st.write(f"Parent directory: {parent_dir}")
+                                st.write(f"Parent exists: {os.path.exists(parent_dir)}")
+                                if os.path.exists(parent_dir):
+                                    st.write(f"Files in parent: {os.listdir(parent_dir)}")
+                    else:
+                        with audio_debug_expander:
+                            st.write("No audio path found in database")
+                            
+                if conn:
+                    conn.close()
+            except Exception as e:
+                with audio_debug_expander:
+                    st.error(f"Error retrieving audio path: {e}")
+                    st.write(f"Exception type: {type(e).__name__}")
+                    st.write(f"Traceback: {traceback.format_exc()}")
+            
+            # Use fallback if standard path failed
+            if not full_slowed_audio_path or not os.path.exists(full_slowed_audio_path):
+                with audio_debug_expander:
+                    st.write("Primary audio path failed, attempting fallback...")
+                
+                # Try the fallback method
+                fallback_path = find_audio_file_for_video(video_id, video_dir_name)
+                
+                with audio_debug_expander:
+                    st.write(f"Fallback path: {fallback_path}")
+                    st.write(f"Fallback exists: {os.path.exists(fallback_path) if fallback_path else False}")
+                
+                if fallback_path and os.path.exists(fallback_path):
+                    full_slowed_audio_path = fallback_path
+            
+            # Create and display the unified HTML component
+            html_content = create_vocab_component(
+                vocab_map, 
+                full_slowed_audio_path, 
+                filter_q,
+                sort_option
+            )
+            
+            # All HTML, CSS, JavaScript, and audio in a SINGLE component
+            height_calculation = min(800, len(vocab_map) * 150 + 200)  # Extra height for controls
+            st.components.v1.html(
+                html_content, 
+                height=height_calculation, 
+                scrolling=True
+            )
+
+def load_existing_vocab(tab_word, video_id, video_dir_name):
+    """
+    Loads existing vocabulary data from the database for an already analyzed video.
+    
+    Args:
+        tab_word: Streamlit tab object for the vocabulary tab
+        video_id: ID of the current video
+        video_dir_name: Directory name for the current video data
+    """
+    # Reconstruct vocab_map from database
+    vocab_map = {}
+    
+    try:
+        conn = get_db_connection()
+        if conn:
+            # Get all phrase analyses for this video
+            cursor = conn.execute("""
+                SELECT gpa.gpt_phrase_json, gpa.phrase_words_for_sync_json 
+                FROM GptPhraseAnalyses gpa 
+                JOIN Segments s ON gpa.segment_id = s.id 
+                WHERE s.video_id = ?
+            """, (video_id,))
+            
+            for row in cursor.fetchall():
+                phrase_data = json.loads(row["gpt_phrase_json"])
+                phrase_sync_words = json.loads(row["phrase_words_for_sync_json"]) if row["phrase_words_for_sync_json"] else None
+                
+                # Collect vocabulary with enhanced timing data
+                collect_vocab_with_kanji({"phrases": [phrase_data]}, vocab_map, phrase_sync_words)
+            
+            conn.close()
+            
+            # Populate the vocabulary tab
+            populate_vocab_tab(tab_word, vocab_map, video_id, video_dir_name)
+    except Exception as e:
+        with tab_word:
+            st.error(f"Error loading vocabulary data: {e}")
 
 def run_full_pipeline(url: str, force: bool):
     """
@@ -888,14 +1602,14 @@ def run_full_pipeline(url: str, force: bool):
     """
     # Setup status placeholders
     status_placeholder = st.empty()
-    progress_bar_placeholder = st.empty()
+    #progress_bar_placeholder = st.empty()
     
     # Create tabs immediately
     tabs = st.tabs(["전체 스크립트", "구문 분석", "단어", "한자", "전체 텍스트", "JSON 데이터"])
     tab1, tab2, tab_word, tab3, tab4, tab5 = tabs
     
     status_placeholder.info("1단계: 초기화 및 다운로드 중...")
-    progress_bar_placeholder.progress(0.05)
+    #progress_bar_placeholder.progress(0.05)
     
     conn = get_db_connection()
     if conn is None:
@@ -927,16 +1641,52 @@ def run_full_pipeline(url: str, force: bool):
             video_id = existing_video["id"]
             video_dir_name = existing_video["video_data_directory"]
             video_info = conn.execute("SELECT full_slowed_audio_path, full_transcript_text, raw_deepgram_response_json, full_words_for_sync_json FROM Videos WHERE id = ?", (video_id,)).fetchone()
+            video_info = dict(video_info) 
+
+            missing_words  = not video_info["full_words_for_sync_json"]
+            missing_audio  = not video_info["full_slowed_audio_path"]
+            missing_text   = not video_info["full_transcript_text"]
+
+            if missing_words or missing_audio or missing_text:
+                raw_json = json.loads(video_info["raw_deepgram_response_json"])
+
+                if missing_words:
+                    words = extract_words_for_sync(raw_json)
+                    cursor.execute(
+                        "UPDATE Videos SET full_words_for_sync_json = ? WHERE id = ?",
+                        (json.dumps(words), video_id)
+                    )
+                    video_info["full_words_for_sync_json"] = json.dumps(words)
+
+                if missing_audio:
+                    path = find_audio_file_for_video(video_id, video_dir_name)
+                    if path:
+                        cursor.execute(
+                            "UPDATE Videos SET full_slowed_audio_path = ? WHERE id = ?",
+                            (Path(path).name, video_id)
+                        )
+                        video_info["full_slowed_audio_path"] = Path(path).name
+
+                if missing_text:
+                    full_text = raw_json["results"]["channels"][0]["alternatives"][0]["transcript"].replace(" ", "")
+                    cursor.execute(
+                        "UPDATE Videos SET full_transcript_text = ? WHERE id = ?",
+                        (full_text, video_id)
+                    )
+                    video_info["full_transcript_text"] = full_text
+
+                conn.commit()
+
             
             # Fill tab 1: Full transcript
-            if video_info and video_info["full_slowed_audio_path"] and video_info["full_words_for_sync_json"]:
+            if video_info and "full_slowed_audio_path" in video_info and video_info["full_slowed_audio_path"] and "full_words_for_sync_json" in video_info and video_info["full_words_for_sync_json"]:
                 full_words_for_sync = json.loads(video_info["full_words_for_sync_json"])
                 full_audio_path = AUDIO_FILES_STORAGE_ROOT_ABS_PATH / video_dir_name / video_info["full_slowed_audio_path"]
                 with tab1:
                     create_synchronized_player(str(full_audio_path), full_words_for_sync)
             
-            # Build vocabulary map from existing phrase data
-            vocab_map = {}
+            # Use the enhanced vocabulary loading function for an existing video
+            load_existing_vocab(tab_word, video_id, video_dir_name)
             
             # Fill tab 2: Analysis
             with tab2:
@@ -956,111 +1706,12 @@ def run_full_pipeline(url: str, force: bool):
                             gpt_phrase = json.loads(phrase["gpt_phrase_json"])
                             gpt_json["phrases"].append(gpt_phrase)
                             phrase_audio_map[i] = phrase["phrase_slowed_audio_path"]
-                            
-                            # Collect vocabulary words with kanji
-                            collect_vocab_with_kanji({"phrases": [gpt_phrase]}, vocab_map)
                         
                         segment_analysis = {"gpt_json": gpt_json, "phrase_audio_map": phrase_audio_map}
                         html = generate_breakdown_html_from_session_state(segment_analysis, video_dir_name, segment_id)
                         with seg_container:
                             st.components.v1.html(html, height=max(150, len(gpt_json["phrases"]) * 400), scrolling=True)
                             st.markdown("<hr style='border-top:1.5px solid #ddd; margin-top:20px; margin-bottom:20px'>", unsafe_allow_html=True)
-            
-            # Save vocab map to session state
-            st.session_state["vocab_map"] = vocab_map
-            
-            # Fill tab_word: Vocabulary
-            with tab_word:
-                st.subheader("📚 단어 (Kanji Vocabulary)")
-                
-                if not vocab_map:
-                    st.info("이 영상에 한자가 포함된 단어가 없습니다.")
-                else:
-                    # Optional filter box
-                    col1, col2 = st.columns([3, 1])
-                    with col1:
-                        filter_q = st.text_input("검색 / 필터 (일본어 또는 의미로 검색)", "")
-                    with col2:
-                        sort_option = st.selectbox("정렬 기준", ["일본어순", "한자순"])
-                    
-                    # Sort items based on user selection
-                    if sort_option == "일본어순":
-                        sorted_items = sorted(vocab_map.items())
-                    else:  # "한자순"
-                        sorted_items = sorted(vocab_map.items(), key=lambda x: x[1]["kanji"])
-                    
-                    # Filter based on search query
-                    filtered_items = [
-                        (jp, info) for jp, info in sorted_items 
-                        if not filter_q or (filter_q.lower() in jp.lower() or filter_q.lower() in info["meaning"].lower())
-                    ]
-                    
-                    # Display vocabulary as cards in a grid
-                    if filtered_items:
-                        st.markdown("""
-                        <style>
-                        .vocab-card {
-                            border: 1px solid #e0e0e0;
-                            border-radius: 8px;
-                            padding: 20px; /* Increased padding for more space */
-                            margin-bottom: 12px;
-                            background-color: #ffffff;
-                            box-shadow: 0 2px 4px rgba(0,0,0,0.05);
-                            transition: box-shadow 0.2s, transform 0.2s;
-                            text-align: center; /* Center align all text */
-                        }
-                        .vocab-card:hover {
-                            box-shadow: 0 4px 8px rgba(0,0,0,0.1);
-                            transform: translateY(-2px);
-                        }
-                        .vocab-japanese {
-                            font-size: 2.2rem; /* Significantly increased from 1.5rem */
-                            margin-bottom: 16px; /* Increased for better spacing */
-                            color: #2c3e50;
-                            font-weight: 500;
-                            line-height: 1.4; /* Added to handle multi-line vocabulary */
-                        }
-                        .vocab-meaning {
-                            font-size: 1.4rem; /* Increased from 1.1rem */
-                            color: #16a085;
-                            font-weight: 500;
-                        }
-                        /* Keep rt (furigana) styling the same size */
-                        rt {
-                            font-size: 0.7em;
-                            color: #555;
-                            opacity: 0.9;
-                        }
-                        </style>
-                        """, unsafe_allow_html=True)
-                        
-                        # Create grid layout
-                        cols = st.columns(2)
-                        
-                        for i, (jp, info) in enumerate(filtered_items):
-                            with cols[i % 2]:
-                                # Create furigana HTML
-                                jp_with_furigana = jp
-                                kanji_readings = info.get("kanji_readings", {})
-                                
-                                if kanji_readings:
-                                    for kanji, reading in kanji_readings.items():
-                                        if kanji in jp:
-                                            jp_with_furigana = jp_with_furigana.replace(
-                                                kanji, 
-                                                f'<ruby>{kanji}<rt>{reading}</rt></ruby>'
-                                            )
-                                
-                                # Generate card HTML
-                                card_html = f"""
-                                <div class="vocab-card">
-                                    <div class="vocab-japanese">{jp_with_furigana}</div>
-                                    <div class="vocab-meaning">{info["meaning"]}</div>
-                                </div>
-                                """
-                                st.markdown(card_html, unsafe_allow_html=True)
-                    else:
-                        st.info("검색 결과가 없습니다.")
             
             # Fill tab 3: Kanji
             with tab3:
@@ -1088,12 +1739,12 @@ def run_full_pipeline(url: str, force: bool):
             
             # Fill tab 4: Full text
             with tab4:
-                if video_info and video_info["full_transcript_text"]:
+                if video_info and "full_transcript_text" in video_info and video_info["full_transcript_text"]:
                     st.text_area("전체 텍스트", video_info["full_transcript_text"], height=300)
             
             # Fill tab 5: JSON data
             with tab5:
-                if video_info and video_info["raw_deepgram_response_json"]:
+                if video_info and "raw_deepgram_response_json" in video_info and video_info["raw_deepgram_response_json"]:
                     st.json(json.loads(video_info["raw_deepgram_response_json"]))
             
             # Save results to session state
@@ -1132,7 +1783,7 @@ def run_full_pipeline(url: str, force: bool):
         cursor.execute("UPDATE Videos SET full_slowed_audio_path = ? WHERE id = ?", (slowed_full_audio_name, video_id))
         
         # Update progress
-        progress_bar_placeholder.progress(0.2)
+        #progress_bar_placeholder.progress(0.2)
         status_placeholder.info("음성 변환 완료. 스크립트 변환 중...")
         
         # Transcribe audio
@@ -1142,7 +1793,7 @@ def run_full_pipeline(url: str, force: bool):
             return None
         
         # Process transcript data
-        progress_bar_placeholder.progress(0.3)
+        #progress_bar_placeholder.progress(0.3)
         status_placeholder.info("스크립트 처리 중...")
         
         full_transcript, segments_list = prepare_japanese_segments(transcript_data)
@@ -1182,7 +1833,7 @@ def run_full_pipeline(url: str, force: bool):
         
         # STAGE 2: Analyze segments with GPT
         status_placeholder.info("구문 분석 시작...")
-        progress_bar_placeholder.progress(0.4)
+        #progress_bar_placeholder.progress(0.4)
         
         # Create a container for segments in Tab 2
         with tab2:
@@ -1198,16 +1849,13 @@ def run_full_pipeline(url: str, force: bool):
         for i, segment in enumerate(segment_db_data):
             segment_progress = 0.4 + (0.5 * ((i+1) / total_segments))  # Fixed to reach 0.9 at the end
             status_placeholder.info(f"세그먼트 {i + 1}/{total_segments} GPT 분석 중...")
-            progress_bar_placeholder.progress(segment_progress)
+            #progress_bar_placeholder.progress(segment_progress)
             
             # Analyze segment
             db_segment_id = segment['db_id']
             gpt_analysis = analyze_japanese_segment(
                 segment['text'], segment['start'], segment['end'], segment['words']
             )
-            
-            # Collect vocabulary with kanji
-            collect_vocab_with_kanji(gpt_analysis, vocab_map)
             
             # Process phrases and create audio segments
             segment_analysis = {"gpt_json": gpt_analysis, "phrase_audio_map": {}}
@@ -1219,20 +1867,30 @@ def run_full_pipeline(url: str, force: bool):
                     for p in gpt_phrases
                 ]
                 phrases_dir = video_dir_abs_path / "phrases"
+                
+                # Create phrase audio segments
                 audio_map = create_phrase_audio_segments(
                     downloaded_audio_path, gpt_phrases, phrase_timings, 
                     phrases_dir, 0.75, db_segment_id
                 )
                 segment_analysis["phrase_audio_map"] = audio_map
-                
-                # Save phrase data to database
+
+                # Process each phrase
                 for p_idx, p_item in enumerate(gpt_phrases):
+                    # Get the audio filename for this phrase from the audio map
                     p_audio_filename = audio_map.get(p_idx)
+                    
+                    # Extract sync words for this phrase
                     p_sync_words = extract_phrase_words_for_sync(
                         transcript_data, 
                         p_item.get("original_start_time", 0),
                         p_item.get("original_end_time", 0)
                     )
+                    
+                    # Collect vocab with kanji and timing - use the enhanced function
+                    collect_vocab_with_kanji({"phrases": [p_item]}, vocab_map, p_sync_words)
+                    
+                    # Save phrase data to database
                     cursor.execute("""
                     INSERT INTO GptPhraseAnalyses 
                     (segment_id, phrase_index_in_segment, gpt_phrase_json, phrase_slowed_audio_path, phrase_words_for_sync_json) 
@@ -1260,102 +1918,12 @@ def run_full_pipeline(url: str, force: bool):
         # Save vocab map to session state
         st.session_state["vocab_map"] = vocab_map
         
-        # Populate Tab 3 (단어 tab) with vocabulary data
-        with tab_word:
-            st.subheader("📚 단어 (Kanji Vocabulary)")
-            
-            if not vocab_map:
-                st.info("이 영상에 한자가 포함된 단어가 없습니다.")
-            else:
-                # Optional filter box
-                col1, col2 = st.columns([3, 1])
-                with col1:
-                    filter_q = st.text_input("검색 / 필터 (일본어 또는 의미로 검색)", "")
-                with col2:
-                    sort_option = st.selectbox("정렬 기준", ["일본어순", "한자순"])
-                
-                # Sort items based on user selection
-                if sort_option == "일본어순":
-                    sorted_items = sorted(vocab_map.items())
-                else:  # "한자순"
-                    sorted_items = sorted(vocab_map.items(), key=lambda x: x[1]["kanji"])
-                
-                # Filter based on search query
-                filtered_items = [
-                    (jp, info) for jp, info in sorted_items 
-                    if not filter_q or (filter_q.lower() in jp.lower() or filter_q.lower() in info["meaning"].lower())
-                ]
-                
-                # Display vocabulary as cards in a grid
-                if filtered_items:
-                    st.markdown("""
-                    <style>
-                    .vocab-card {
-                        border: 1px solid #e0e0e0;
-                        border-radius: 8px;
-                        padding: 20px; /* Increased padding for more space */
-                        margin-bottom: 12px;
-                        background-color: #ffffff;
-                        box-shadow: 0 2px 4px rgba(0,0,0,0.05);
-                        transition: box-shadow 0.2s, transform 0.2s;
-                        text-align: center; /* Center align all text */
-                    }
-                    .vocab-card:hover {
-                        box-shadow: 0 4px 8px rgba(0,0,0,0.1);
-                        transform: translateY(-2px);
-                    }
-                    .vocab-japanese {
-                        font-size: 2.2rem; /* Significantly increased from 1.5rem */
-                        margin-bottom: 16px; /* Increased for better spacing */
-                        color: #2c3e50;
-                        font-weight: 500;
-                        line-height: 1.4; /* Added to handle multi-line vocabulary */
-                    }
-                    .vocab-meaning {
-                        font-size: 1.4rem; /* Increased from 1.1rem */
-                        color: #16a085;
-                        font-weight: 500;
-                    }
-                    /* Keep rt (furigana) styling the same size */
-                    rt {
-                        font-size: 0.7em;
-                        color: #555;
-                        opacity: 0.9;
-                    }
-                    </style>
-                    """, unsafe_allow_html=True)
-                    
-                    # Create grid layout
-                    cols = st.columns(2)
-                    
-                    for i, (jp, info) in enumerate(filtered_items):
-                        with cols[i % 2]:
-                            # Create furigana HTML
-                            jp_with_furigana = jp
-                            kanji_readings = info.get("kanji_readings", {})
-                            
-                            if kanji_readings:
-                                for kanji, reading in kanji_readings.items():
-                                    if kanji in jp:
-                                        jp_with_furigana = jp_with_furigana.replace(
-                                            kanji, 
-                                            f'<ruby>{kanji}<rt>{reading}</rt></ruby>'
-                                        )
-                            
-                            # Generate card HTML
-                            card_html = f"""
-                            <div class="vocab-card">
-                                <div class="vocab-japanese">{jp_with_furigana}</div>
-                                <div class="vocab-meaning">{info["meaning"]}</div>
-                            </div>
-                            """
-                            st.markdown(card_html, unsafe_allow_html=True)
-                else:
-                    st.info("검색 결과가 없습니다.")
+        # Populate Tab 3 (단어 tab) with enhanced vocabulary implementation
+        populate_vocab_tab(tab_word, vocab_map, video_id, video_dir_name)
         
         # STAGE 3: Extract kanji information
         status_placeholder.info("한자 정보 추출 및 저장 중...")
-        progress_bar_placeholder.progress(0.95)
+        #progress_bar_placeholder.progress(0.95)
         
         extract_and_store_kanji_for_video(conn, video_id)
         
@@ -1386,7 +1954,7 @@ def run_full_pipeline(url: str, force: bool):
         
         # Final status
         status_placeholder.success("모든 처리 완료!")
-        progress_bar_placeholder.progress(1.0)
+        #progress_bar_placeholder.progress(1.0)
         
         # Save results to session state
         st.session_state["last_video_id"] = video_id
@@ -1439,5 +2007,6 @@ if "last_video_id" in st.session_state:
     if conn:
         video_info = conn.execute("SELECT video_title, video_data_directory FROM Videos WHERE id = ?", (st.session_state["last_video_id"],)).fetchone()
         if video_info:
-            st.success(f"최근 분석: {video_info['video_title']}")
+            #st.success(f"최근 분석: {video_info['video_title']}")
+            pass
         conn.close()
