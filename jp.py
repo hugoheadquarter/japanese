@@ -18,7 +18,7 @@ import traceback
 import sys # For sys.exit
 
 # Set page config here (once only)
-st.set_page_config(page_title="動画分析")
+st.set_page_config(page_title="日本語")
 
 # Load environment variables early
 load_dotenv()
