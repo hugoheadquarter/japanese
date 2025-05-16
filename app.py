@@ -848,6 +848,26 @@ def extract_and_store_kanji_for_video(conn, video_id):
         except sqlite3.IntegrityError: pass
     conn.commit()
 
+# Add a new helper function to collect vocabulary with kanji
+def collect_vocab_with_kanji(gpt_json, vocab_map):
+    """
+    Mutates `vocab_map` (dict keyed by 일본어) with any words in `gpt_json`
+    whose kanji field is non-empty.
+    """
+    if not gpt_json or "phrases" not in gpt_json:
+        return
+
+    for phrase in gpt_json["phrases"]:
+        for w in phrase.get("words", []):
+            if w.get("kanji"):
+                jp = w.get("japanese", "")
+                if jp and jp not in vocab_map:  # keep first occurrence
+                    vocab_map[jp] = {
+                        "kanji": w.get("kanji", ""),
+                        "romaji": w.get("romaji", ""),
+                        "meaning": w.get("meaning", "")
+                    }
+
 def run_full_pipeline(url: str, force: bool):
     """
     Execute the complete analysis pipeline in a single run, streaming UI updates progressively.
@@ -864,8 +884,8 @@ def run_full_pipeline(url: str, force: bool):
     progress_bar_placeholder = st.empty()
     
     # Create tabs immediately
-    tabs = st.tabs(["전체 스크립트", "구문 분석", "한자", "전체 텍스트", "JSON 데이터"])
-    tab1, tab2, tab3, tab4, tab5 = tabs
+    tabs = st.tabs(["전체 스크립트", "구문 분석", "단어", "한자", "전체 텍스트", "JSON 데이터"])
+    tab1, tab2, tab_word, tab3, tab4, tab5 = tabs
     
     status_placeholder.info("1단계: 초기화 및 다운로드 중...")
     progress_bar_placeholder.progress(0.05)
@@ -908,6 +928,9 @@ def run_full_pipeline(url: str, force: bool):
                 with tab1:
                     create_synchronized_player(str(full_audio_path), full_words_for_sync)
             
+            # Build vocabulary map from existing phrase data
+            vocab_map = {}
+            
             # Fill tab 2: Analysis
             with tab2:
                 seg_container = st.container()
@@ -926,12 +949,41 @@ def run_full_pipeline(url: str, force: bool):
                             gpt_phrase = json.loads(phrase["gpt_phrase_json"])
                             gpt_json["phrases"].append(gpt_phrase)
                             phrase_audio_map[i] = phrase["phrase_slowed_audio_path"]
+                            
+                            # Collect vocabulary words with kanji
+                            collect_vocab_with_kanji({"phrases": [gpt_phrase]}, vocab_map)
                         
                         segment_analysis = {"gpt_json": gpt_json, "phrase_audio_map": phrase_audio_map}
                         html = generate_breakdown_html_from_session_state(segment_analysis, video_dir_name, segment_id)
                         with seg_container:
                             st.components.v1.html(html, height=max(150, len(gpt_json["phrases"]) * 400), scrolling=True)
                             st.markdown("<hr style='border-top:1.5px solid #ddd; margin-top:20px; margin-bottom:20px'>", unsafe_allow_html=True)
+            
+            # Save vocab map to session state
+            st.session_state["vocab_map"] = vocab_map
+            
+            # Fill tab_word: Vocabulary
+            with tab_word:
+                st.subheader("📚 단어 (Kanji Vocabulary)")
+                
+                if not vocab_map:
+                    st.info("이 영상에 한자가 포함된 단어가 없습니다.")
+                else:
+                    # Optional filter box
+                    filter_q = st.text_input("검색 / 필터", "")
+                    
+                    # Convert to list-of-dicts for display
+                    rows = [
+                        {
+                          "일본어": jp,
+                          "로마자": info["romaji"],
+                          "의미": info["meaning"],
+                          "한자": info["kanji"],
+                        }
+                        for jp, info in sorted(vocab_map.items())
+                        if not filter_q or (filter_q in jp or filter_q in info["meaning"])
+                    ]
+                    st.dataframe(rows, hide_index=True, use_container_width=True)
             
             # Fill tab 3: Kanji
             with tab3:
@@ -1058,6 +1110,9 @@ def run_full_pipeline(url: str, force: bool):
         # Create a container for segments in Tab 2
         with tab2:
             segments_container = st.container()
+        
+        # Initialize vocabulary map
+        vocab_map = {}
             
         # Process each segment
         segment_analyses = {}
@@ -1073,6 +1128,9 @@ def run_full_pipeline(url: str, force: bool):
             gpt_analysis = analyze_japanese_segment(
                 segment['text'], segment['start'], segment['end'], segment['words']
             )
+            
+            # Collect vocabulary with kanji
+            collect_vocab_with_kanji(gpt_analysis, vocab_map)
             
             # Process phrases and create audio segments
             segment_analysis = {"gpt_json": gpt_analysis, "phrase_audio_map": {}}
@@ -1121,6 +1179,32 @@ def run_full_pipeline(url: str, force: bool):
                 )
                 st.markdown("<hr style='border-top:1.5px solid #ddd; margin-top:20px; margin-bottom:20px'>", 
                            unsafe_allow_html=True)
+        
+        # Save vocab map to session state
+        st.session_state["vocab_map"] = vocab_map
+        
+        # Populate Tab 3 (단어 tab) with vocabulary data
+        with tab_word:
+            st.subheader("📚 단어 (Kanji Vocabulary)")
+            
+            if not vocab_map:
+                st.info("이 영상에 한자가 포함된 단어가 없습니다.")
+            else:
+                # Optional filter box
+                filter_q = st.text_input("검색 / 필터", "")
+                
+                # Convert to list-of-dicts for display
+                rows = [
+                    {
+                      "일본어": jp,
+                      "로마자": info["romaji"],
+                      "의미": info["meaning"],
+                      "한자": info["kanji"],
+                    }
+                    for jp, info in sorted(vocab_map.items())
+                    if not filter_q or (filter_q in jp or filter_q in info["meaning"])
+                ]
+                st.dataframe(rows, hide_index=True, use_container_width=True)
         
         # STAGE 3: Extract kanji information
         status_placeholder.info("한자 정보 추출 및 저장 중...")
