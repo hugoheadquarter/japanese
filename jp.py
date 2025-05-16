@@ -679,6 +679,23 @@ def create_phrase_synchronized_player(phrase_audio_abs_path_str: str,
         <script>
         (function() {{ // IIFE for encapsulation
             "use strict";
+            
+            // ─── Global guard so only one phrase can play at a time ─────────────
+            if (!window.__phraseAudioManager) {{
+              window.__phraseAudioManager = {{
+                currentAudio: null,     // <audio> element that is playing
+                clearFn:     null,      // function that removes its highlights
+                stopCurrent() {{
+                  if (this.currentAudio) {{
+                    try {{ this.currentAudio.pause(); }} catch(e) {{}}
+                  }}
+                  if (this.clearFn) {{ this.clearFn(); }}
+                  this.currentAudio = null;
+                  this.clearFn     = null;
+                }}
+              }};
+            }}
+            
             const wordsDataPhrase = {words_json};
             const kanjiReadingsMap = JSON.parse('{kanji_map_for_js_str}'); // Parse the JSON string
             const audioPlayerPhrase = document.getElementById('{audio_element_id}'); // Might be null
@@ -692,6 +709,14 @@ def create_phrase_synchronized_player(phrase_audio_abs_path_str: str,
             if (!wordsDataPhrase || wordsDataPhrase.length === 0) {{
                 // textDisplayPhrase.innerHTML = "<p style='font-size:16px; color:grey; text-align:center;'>No text for this phrase.</p>"; // Already handled by Python
                 return; 
+            }}
+            
+            // helper that resets *this* phrase's word colours
+            function clearHighlightsLocal() {{
+              wordsDataPhrase.forEach((_, idx) => {{
+                const el = document.getElementById(`word-phrase-{phrase_unique_id}-word-${{idx}}`);
+                if (el) {{ el.style.color = ''; el.style.fontWeight = 'normal'; }}
+              }});
             }}
 
             function generateFuriganaHTML(text, readingsMap) {{
@@ -731,15 +756,29 @@ def create_phrase_synchronized_player(phrase_audio_abs_path_str: str,
                     wordSpan.style.marginRight = '2px'; // Small spacing between words
 
                     wordSpan.onclick = () => {{
-                        if (audioPlayerPhrase) {{ // Play only if audio element exists
-                            audioPlayerPhrase.currentTime = wordObj.start;
-                            audioPlayerPhrase.play().catch(e => console.warn("Phrase audio play failed:", e));
-                        }}
+                        if (!audioPlayerPhrase) {{ return; }}
+                        
+                        /* ① stop whatever is playing elsewhere */
+                        window.__phraseAudioManager.stopCurrent();
+                        
+                        /* ② register this phrase as the new "current" */
+                        window.__phraseAudioManager.currentAudio = audioPlayerPhrase;
+                        window.__phraseAudioManager.clearFn = clearHighlightsLocal;
+                        
+                        /* ③ start playback */
+                        audioPlayerPhrase.currentTime = wordObj.start;
+                        audioPlayerPhrase.play().catch(e => console.warn('Phrase audio play failed:', e));
                     }};
                     wordSpan.ondblclick = (event) => {{
                         event.preventDefault(); // Prevent text selection
                         if (audioPlayerPhrase) {{
                             audioPlayerPhrase.pause();
+                            
+                            // Also clear from manager if this is the current audio
+                            if (window.__phraseAudioManager.currentAudio === audioPlayerPhrase) {{
+                                window.__phraseAudioManager.currentAudio = null;
+                                window.__phraseAudioManager.clearFn = null;
+                            }}
                         }}
                     }};
                     phraseWordsContainer.appendChild(wordSpan);
@@ -772,10 +811,11 @@ def create_phrase_synchronized_player(phrase_audio_abs_path_str: str,
                 if (audioPlayerPhrase) {{ // Add event listeners only if audio element is present
                     audioPlayerPhrase.addEventListener('timeupdate', updatePhraseWordHighlights);
                     audioPlayerPhrase.addEventListener('ended', () => {{ // Clear highlights on end
-                        wordsDataPhrase.forEach((wordObj, index) => {{
-                             const wordElement = document.getElementById(`word-phrase-{phrase_unique_id}-word-${{index}}`);
-                             if(wordElement) {{wordElement.style.color = ''; wordElement.style.fontWeight = 'normal';}}
-                        }});
+                        clearHighlightsLocal();
+                        if (window.__phraseAudioManager.currentAudio === audioPlayerPhrase) {{
+                            window.__phraseAudioManager.currentAudio = null;
+                            window.__phraseAudioManager.clearFn = null;
+                        }}
                     }});
                 }}
             }} catch (e) {{
