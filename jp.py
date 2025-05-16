@@ -25,6 +25,36 @@ load_dotenv()
 DEEPGRAM_API_KEY = os.getenv('DEEPGRAM_API_KEY')
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 
+# ───────────────────────────────
+# Sidebar helpers
+# ───────────────────────────────
+def sidebar_history():
+    """Show all previously-processed videos."""
+    conn = get_db_connection()
+    if not conn:
+        st.warning("DB 연결 실패")
+        return
+    rows = conn.execute(
+        """
+        SELECT id, youtube_url, video_title,
+               COALESCE(created_at, id) AS ts   -- fallback if no created_at
+        FROM Videos
+        ORDER BY ts DESC
+        """
+    ).fetchall()
+    conn.close()
+
+    if not rows:
+        st.info("분석된 영상이 없습니다.")
+        return
+
+    st.markdown("##### 🔍 처리 내역")
+    for r in rows:
+        url = r["youtube_url"]
+        title = r["video_title"] or url
+        st.markdown(f"- [{title}]({url})")
+
+
 # Import fuzzy matching early so it's available to all helper functions
 try:
     from rapidfuzz import process, fuzz
@@ -1447,6 +1477,9 @@ def create_vocab_component(vocab_map, full_slowed_audio_path, filter_query="", s
     
     return html_content
 
+
+
+
 def populate_vocab_tab(tab_word, vocab_map, video_id, video_dir_name):
     """
     Populates the vocabulary tab with an interactive word display.
@@ -1589,6 +1622,21 @@ def load_existing_vocab(tab_word, video_id, video_dir_name):
         with tab_word:
             st.error(f"Error loading vocabulary data: {e}")
 
+def _estimate_phrase_px(p):
+    """
+    crude but reliable:
+    - 110 px  : player + top margin
+    - 38 px   : header line itself
+    - 30 px   : every  word-row in the table
+    - 20 px   : kanji block if present
+    - 40 px   : meaning paragraph
+    """
+    base = 110 + 38 + 40                    # player + header + meaning
+    word_rows   = max(1, len(p.get("words", [])))
+    kanji_block = 20 if p.get("kanji_explanations") else 0
+    return base + (word_rows * 30) + kanji_block
+
+
 def run_full_pipeline(url: str, force: bool):
     """
     Execute the complete analysis pipeline in a single run, streaming UI updates progressively.
@@ -1605,10 +1653,10 @@ def run_full_pipeline(url: str, force: bool):
     #progress_bar_placeholder = st.empty()
     
     # Create tabs immediately
-    tabs = st.tabs(["전체 스크립트", "구문 분석", "단어", "한자", "전체 텍스트", "JSON 데이터"])
+    tabs = st.tabs(["스크립트", "문장", "단어", "한자", "텍스트", "JSON"])
     tab1, tab2, tab_word, tab3, tab4, tab5 = tabs
     
-    status_placeholder.info("1단계: 초기화 및 다운로드 중...")
+    status_placeholder.info("1단계: 다운로드 중...")
     #progress_bar_placeholder.progress(0.05)
     
     conn = get_db_connection()
@@ -1710,7 +1758,14 @@ def run_full_pipeline(url: str, force: bool):
                         segment_analysis = {"gpt_json": gpt_json, "phrase_audio_map": phrase_audio_map}
                         html = generate_breakdown_html_from_session_state(segment_analysis, video_dir_name, segment_id)
                         with seg_container:
-                            st.components.v1.html(html, height=max(150, len(gpt_json["phrases"]) * 400), scrolling=True)
+                            phrases      = segment_analysis["gpt_json"].get("phrases", [])
+                            segment_px   = sum(_estimate_phrase_px(p) for p in phrases) + 40  # + small buffer
+                            segment_px   = max(200, min(segment_px, 2000))   # safety clamp
+                            st.components.v1.html(
+                                html,
+                                height = segment_px,
+                                scrolling = True
+                            )
                             st.markdown("<hr style='border-top:1.5px solid #ddd; margin-top:20px; margin-bottom:20px'>", unsafe_allow_html=True)
             
             # Fill tab 3: Kanji
@@ -1980,27 +2035,55 @@ def run_full_pipeline(url: str, force: bool):
                 print(f"Temp directory cleanup error: {e_cleanup}")  # Log cleanup errors
 
 # --- Main Streamlit App UI ---
-st.title("🇯🇵")
+st.title("일본어 🇯🇵")
+
+# ───────── sidebar navigation ─────────
+side = st.sidebar
+choice = side.radio(
+    "**메뉴**",
+    ("Home", "History", "Sources"),
+    index=0,
+)
 
 if not OPENAI_API_KEY: st.sidebar.error("OpenAI API key missing.")
 if not DEEPGRAM_API_KEY: st.sidebar.error("Deepgram API key missing.")
-st.sidebar.header("API 상태")
-st.sidebar.markdown(f"OpenAI API: {'✅' if OPENAI_API_KEY else '❌'}")
-st.sidebar.markdown(f"Deepgram API: {'✅' if DEEPGRAM_API_KEY else '❌'}")
 
-youtube_url_input = st.text_input("YouTube URL:", placeholder="여기에 URL을 입력하세요...")
-force_reprocess_checkbox = st.checkbox("강제 재처리 (이미 분석된 영상일 경우)")
+if choice == "Home":
+    youtube_url_input = side.text_input("YouTube URL:", placeholder="")
+    force_reprocess_checkbox = side.checkbox("재처리")
+    analyze_button = side.button("분석 시작")
 
-analyze_button = st.button("분석 시작")
+    # the original on-click logic stays identical
+    if analyze_button:
+        if not youtube_url_input.strip():
+            st.warning("YouTube URL을 입력해주세요.")
+        elif not (OPENAI_API_KEY and DEEPGRAM_API_KEY):
+            st.warning("API 키가 누락되었습니다.")
+        else:
+            run_full_pipeline(youtube_url_input.strip(), force_reprocess_checkbox)
 
-if analyze_button:
-    if not youtube_url_input.strip():
-        st.warning("YouTube URL을 입력해주세요.")
-    elif not (OPENAI_API_KEY and DEEPGRAM_API_KEY):
-        st.warning("API 키가 누락되었습니다.")
-    else:
-        run_full_pipeline(youtube_url_input.strip(), force_reprocess_checkbox)
+# -------- History tab --------
+elif choice == "History":
+    sidebar_history()          # call the helper
+    analyze_button = False     # nothing to run
 
+# -------- Sources tab --------
+else:  # choice == "Sources"
+    # -- MAIN PAGE copy (new) ----------------------------------------
+    st.markdown(
+        """
+### 📰 News  
+<https://www.youtube.com/@tbsnewsdig/videos>
+
+### 🎙️ Podcast  
+<https://www.youtube.com/watch?v=wqdtCeFufQc&list=PLkK7KO2TnEczjRVTgW2fSGxRgWay3Z5a4>
+
+### 🎞️ Anime  
+<https://www.youtube.com/@TMSanimeJP/videos>
+"""
+    )
+
+    analyze_button = False
 # If there's already analyzed video data in the session state, display it
 if "last_video_id" in st.session_state:
     conn = get_db_connection()
