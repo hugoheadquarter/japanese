@@ -862,10 +862,17 @@ def collect_vocab_with_kanji(gpt_json, vocab_map):
             if w.get("kanji"):
                 jp = w.get("japanese", "")
                 if jp and jp not in vocab_map:  # keep first occurrence
+                    # Find kanji readings from kanji_explanations
+                    kanji_readings = {}
+                    for k_exp in phrase.get("kanji_explanations", []):
+                        if k_exp.get("kanji") and k_exp.get("reading"):
+                            kanji_readings[k_exp.get("kanji")] = k_exp.get("reading")
+                    
                     vocab_map[jp] = {
                         "kanji": w.get("kanji", ""),
                         "romaji": w.get("romaji", ""),
-                        "meaning": w.get("meaning", "")
+                        "meaning": w.get("meaning", ""),
+                        "kanji_readings": kanji_readings  # Store readings for furigana display
                     }
 
 def run_full_pipeline(url: str, force: bool):
@@ -970,20 +977,90 @@ def run_full_pipeline(url: str, force: bool):
                     st.info("이 영상에 한자가 포함된 단어가 없습니다.")
                 else:
                     # Optional filter box
-                    filter_q = st.text_input("검색 / 필터", "")
+                    col1, col2 = st.columns([3, 1])
+                    with col1:
+                        filter_q = st.text_input("검색 / 필터 (일본어 또는 의미로 검색)", "")
+                    with col2:
+                        sort_option = st.selectbox("정렬 기준", ["일본어순", "한자순"])
                     
-                    # Convert to list-of-dicts for display
-                    rows = [
-                        {
-                          "일본어": jp,
-                          "로마자": info["romaji"],
-                          "의미": info["meaning"],
-                          "한자": info["kanji"],
-                        }
-                        for jp, info in sorted(vocab_map.items())
-                        if not filter_q or (filter_q in jp or filter_q in info["meaning"])
+                    # Sort items based on user selection
+                    if sort_option == "일본어순":
+                        sorted_items = sorted(vocab_map.items())
+                    else:  # "한자순"
+                        sorted_items = sorted(vocab_map.items(), key=lambda x: x[1]["kanji"])
+                    
+                    # Filter based on search query
+                    filtered_items = [
+                        (jp, info) for jp, info in sorted_items 
+                        if not filter_q or (filter_q.lower() in jp.lower() or filter_q.lower() in info["meaning"].lower())
                     ]
-                    st.dataframe(rows, hide_index=True, use_container_width=True)
+                    
+                    # Display vocabulary as cards in a grid
+                    if filtered_items:
+                        st.markdown("""
+                        <style>
+                        .vocab-card {
+                            border: 1px solid #e0e0e0;
+                            border-radius: 8px;
+                            padding: 20px; /* Increased padding for more space */
+                            margin-bottom: 12px;
+                            background-color: #ffffff;
+                            box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+                            transition: box-shadow 0.2s, transform 0.2s;
+                            text-align: center; /* Center align all text */
+                        }
+                        .vocab-card:hover {
+                            box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+                            transform: translateY(-2px);
+                        }
+                        .vocab-japanese {
+                            font-size: 2.2rem; /* Significantly increased from 1.5rem */
+                            margin-bottom: 16px; /* Increased for better spacing */
+                            color: #2c3e50;
+                            font-weight: 500;
+                            line-height: 1.4; /* Added to handle multi-line vocabulary */
+                        }
+                        .vocab-meaning {
+                            font-size: 1.4rem; /* Increased from 1.1rem */
+                            color: #16a085;
+                            font-weight: 500;
+                        }
+                        /* Keep rt (furigana) styling the same size */
+                        rt {
+                            font-size: 0.7em;
+                            color: #555;
+                            opacity: 0.9;
+                        }
+                        </style>
+                        """, unsafe_allow_html=True)
+                        
+                        # Create grid layout
+                        cols = st.columns(2)
+                        
+                        for i, (jp, info) in enumerate(filtered_items):
+                            with cols[i % 2]:
+                                # Create furigana HTML
+                                jp_with_furigana = jp
+                                kanji_readings = info.get("kanji_readings", {})
+                                
+                                if kanji_readings:
+                                    for kanji, reading in kanji_readings.items():
+                                        if kanji in jp:
+                                            jp_with_furigana = jp_with_furigana.replace(
+                                                kanji, 
+                                                f'<ruby>{kanji}<rt>{reading}</rt></ruby>'
+                                            )
+                                
+                                # Generate card HTML
+                                card_html = f"""
+                                <div class="vocab-card">
+                                    <div class="vocab-japanese">{jp_with_furigana}</div>
+                                    <div class="vocab-meaning">{info["meaning"]}</div>
+                                </div>
+                                """
+                                st.markdown(card_html, unsafe_allow_html=True)
+                    else:
+                        st.info("검색 결과가 없습니다.")
             
             # Fill tab 3: Kanji
             with tab3:
@@ -1191,20 +1268,90 @@ def run_full_pipeline(url: str, force: bool):
                 st.info("이 영상에 한자가 포함된 단어가 없습니다.")
             else:
                 # Optional filter box
-                filter_q = st.text_input("검색 / 필터", "")
+                col1, col2 = st.columns([3, 1])
+                with col1:
+                    filter_q = st.text_input("검색 / 필터 (일본어 또는 의미로 검색)", "")
+                with col2:
+                    sort_option = st.selectbox("정렬 기준", ["일본어순", "한자순"])
                 
-                # Convert to list-of-dicts for display
-                rows = [
-                    {
-                      "일본어": jp,
-                      "로마자": info["romaji"],
-                      "의미": info["meaning"],
-                      "한자": info["kanji"],
-                    }
-                    for jp, info in sorted(vocab_map.items())
-                    if not filter_q or (filter_q in jp or filter_q in info["meaning"])
+                # Sort items based on user selection
+                if sort_option == "일본어순":
+                    sorted_items = sorted(vocab_map.items())
+                else:  # "한자순"
+                    sorted_items = sorted(vocab_map.items(), key=lambda x: x[1]["kanji"])
+                
+                # Filter based on search query
+                filtered_items = [
+                    (jp, info) for jp, info in sorted_items 
+                    if not filter_q or (filter_q.lower() in jp.lower() or filter_q.lower() in info["meaning"].lower())
                 ]
-                st.dataframe(rows, hide_index=True, use_container_width=True)
+                
+                # Display vocabulary as cards in a grid
+                if filtered_items:
+                    st.markdown("""
+                    <style>
+                    .vocab-card {
+                        border: 1px solid #e0e0e0;
+                        border-radius: 8px;
+                        padding: 20px; /* Increased padding for more space */
+                        margin-bottom: 12px;
+                        background-color: #ffffff;
+                        box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+                        transition: box-shadow 0.2s, transform 0.2s;
+                        text-align: center; /* Center align all text */
+                    }
+                    .vocab-card:hover {
+                        box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+                        transform: translateY(-2px);
+                    }
+                    .vocab-japanese {
+                        font-size: 2.2rem; /* Significantly increased from 1.5rem */
+                        margin-bottom: 16px; /* Increased for better spacing */
+                        color: #2c3e50;
+                        font-weight: 500;
+                        line-height: 1.4; /* Added to handle multi-line vocabulary */
+                    }
+                    .vocab-meaning {
+                        font-size: 1.4rem; /* Increased from 1.1rem */
+                        color: #16a085;
+                        font-weight: 500;
+                    }
+                    /* Keep rt (furigana) styling the same size */
+                    rt {
+                        font-size: 0.7em;
+                        color: #555;
+                        opacity: 0.9;
+                    }
+                    </style>
+                    """, unsafe_allow_html=True)
+                    
+                    # Create grid layout
+                    cols = st.columns(2)
+                    
+                    for i, (jp, info) in enumerate(filtered_items):
+                        with cols[i % 2]:
+                            # Create furigana HTML
+                            jp_with_furigana = jp
+                            kanji_readings = info.get("kanji_readings", {})
+                            
+                            if kanji_readings:
+                                for kanji, reading in kanji_readings.items():
+                                    if kanji in jp:
+                                        jp_with_furigana = jp_with_furigana.replace(
+                                            kanji, 
+                                            f'<ruby>{kanji}<rt>{reading}</rt></ruby>'
+                                        )
+                            
+                            # Generate card HTML
+                            card_html = f"""
+                            <div class="vocab-card">
+                                <div class="vocab-japanese">{jp_with_furigana}</div>
+                                <div class="vocab-meaning">{info["meaning"]}</div>
+                            </div>
+                            """
+                            st.markdown(card_html, unsafe_allow_html=True)
+                else:
+                    st.info("검색 결과가 없습니다.")
         
         # STAGE 3: Extract kanji information
         status_placeholder.info("한자 정보 추출 및 저장 중...")
