@@ -559,6 +559,13 @@ def create_synchronized_player(audio_abs_path_str: str, words_for_sync_list: lis
                             audioPlayer.currentTime = wordObj.start; // Seek audio
                             audioPlayer.play().catch(e => console.warn("Audio play failed:", e));
                         }};
+                        
+                        // NEW CODE: Add double-click handler to pause playback
+                        wordSpanElement.ondblclick = (event) => {{
+                            event.preventDefault(); // Prevent text selection
+                            audioPlayer.pause(); // Pause the audio
+                        }};
+                        
                         phraseContainerDiv.appendChild(wordSpanElement);
                     }});
                     textDisplay.appendChild(phraseContainerDiv);
