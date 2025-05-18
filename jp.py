@@ -126,13 +126,13 @@ st.markdown("""
         .kanji-info .meaning-hanja .value { color: #f28b82; font-weight: bold; }
     }
     .kanji-card-container { padding-top: 10px; }
-    .kanji-card { border: 1px solid #e0e0e0; padding: 20px; margin-bottom: 20px; border-radius: 10px; background-color: #ffffff; display: flex; align-items: center; transition: box-shadow 0.2s ease-in-out, transform 0.2s ease-in-out; height: 100%; box-sizing: border-box; }
+    .kanji-card { border: 1px solid #e0e0e0; padding: 20px; margin-bottom: 20px; border-radius: 10px; background-color: #ffffff; display: flex; align-items: center; transition: box-shadow 0.2s ease-in-out, transform 0.2s ease-in-out; height: 180px; box-sizing: border-box; }
     .kanji-card:hover { box-shadow: 0 8px 16px rgba(0,0,0,0.15); transform: translateY(-3px); }
     .kanji-char-display { font-size: 4em; font-weight: bold; margin-right: 25px; min-width: 80px; text-align: center; color: #2c3e50; line-height: 1; }
     .kanji-info { display: flex; flex-direction: column; justify-content: center; font-size: 1.1em; flex-grow: 1; }
     .kanji-info div { margin-bottom: 8px; line-height: 1.5; display: flex; align-items: baseline; }
     .kanji-info div:last-child { margin-bottom: 0; }
-    .kanji-info strong { font-weight: 500; color: #6c757d; margin-right: 8px; min-width: 70px; display: inline-block; }
+    .kanji-info strong { font-weight: 500; color: #6c757d; margin-right: 8px; min-width: 0px; display: inline-block; }
     .kanji-info .value { font-weight: 600; color: #343a40; }
 </style>
 """, unsafe_allow_html=True)
@@ -190,6 +190,37 @@ def transcribe_audio(audio_path_str: str):
                 else: st.error(f"Deepgram (fallback) Error: {response_alt.status_code} - {response_alt.text[:200]}")
             return None
     except Exception as e: st.error(f"Transcription exception: {e}"); return None
+
+def load_kanji_first_occurrences(conn, video_id):
+    """
+    Return {kanji: (first_start_time, seq)}.
+    `seq` is a monotonically increasing index that captures
+    the *first* time we bump into the kanji while scanning the video,
+    so it preserves actual reading order when two kanji share the
+    same start time (特別, 国際, …).
+    """
+    earliest = {}
+    seq      = 0                             # running index
+
+    rows = conn.execute("""
+        SELECT gpa.gpt_phrase_json
+        FROM   GptPhraseAnalyses gpa
+        JOIN   Segments s ON gpa.segment_id = s.id
+        WHERE  s.video_id = ?
+    """, (video_id,))
+
+    for row in rows:
+        phr = json.loads(row["gpt_phrase_json"])
+        t0  = phr.get("original_start_time") or float("inf")
+
+        for ke in phr.get("kanji_explanations", []):
+            k = ke.get("kanji")
+            if k and k not in earliest:
+                earliest[k] = (t0, seq)      # store both time and order
+                seq += 1
+
+    return earliest
+
 
 def prepare_japanese_segments(transcript_data):
     try:
@@ -1816,10 +1847,22 @@ def run_full_pipeline(url: str, force: bool):
             
             # Fill tab 3: Kanji
             with tab3:
-                kanji_entries = conn.execute("SELECT character, reading, meaning FROM KanjiEntries WHERE video_id = ?", (video_id,)).fetchall()
+                kanji_entries = conn.execute("""
+                    SELECT character, reading, meaning 
+                    FROM KanjiEntries 
+                    WHERE video_id = ?
+                """, (video_id,)).fetchall()
+
                 if kanji_entries:
-                    sorted_kanji_items = sorted(kanji_entries, key=lambda x: x['character'])
-                    num_columns = 2
+                    first_map = load_kanji_first_occurrences(conn, video_id)
+
+                    def first_time(row):
+                        # put kanji with no timing at the bottom
+                        return first_map.get(row["character"], float("inf"))
+
+                    sorted_kanji_items = sorted(kanji_entries, key=first_time)
+
+                    num_columns = 4
                     cols = st.columns(num_columns)
                     st.markdown('<div class="kanji-card-container">', unsafe_allow_html=True)
                     for idx, kanji_info in enumerate(sorted_kanji_items):
@@ -1834,7 +1877,7 @@ def run_full_pipeline(url: str, force: bool):
                                 h_mean = parts[1]
                             else:
                                 k_desc = original_meaning
-                            html_c = f"""<div class="kanji-card"><div class="kanji-char-display">{kanji_info['character']}</div><div class="kanji-info"><div class="reading"><strong>Reading:</strong> <span class="value">{kanji_info['reading']}</span></div><div class="meaning-korean"><strong>Korean:</strong> <span class="value">{k_desc}</span></div>{'<div class="meaning-hanja"><strong>Hanja:</strong> <span class="value">' + h_mean + '</span></div>' if h_mean else ''}</div></div>"""
+                            html_c = f"""<div class="kanji-card"><div class="kanji-char-display">{kanji_info['character']}</div><div class="kanji-info"><div class="reading"><strong></strong> <span class="value">{kanji_info['reading']}</span></div><div class="meaning-korean"><strong></strong> <span class="value">{k_desc}</span></div>{'<div class="meaning-hanja"><strong></strong> <span class="value">' + h_mean + '</span></div>' if h_mean else ''}</div></div>"""
                             st.markdown(html_c, unsafe_allow_html=True)
                     st.markdown('</div>', unsafe_allow_html=True)
             
@@ -2030,11 +2073,20 @@ def run_full_pipeline(url: str, force: bool):
         
         # Populate Tab 3 with kanji data
         with tab3:
-            kanji_entries = conn.execute("SELECT character, reading, meaning FROM KanjiEntries WHERE video_id = ?", 
-                                        (video_id,)).fetchall()
+            kanji_entries = conn.execute("""
+                SELECT character, reading, meaning
+                FROM KanjiEntries
+                WHERE video_id = ?
+            """, (video_id,)).fetchall()
+
             if kanji_entries:
-                sorted_kanji_items = sorted(kanji_entries, key=lambda x: x['character'])
-                num_columns = 2
+                first_map = load_kanji_first_occurrences(conn, video_id)
+
+                sorted_kanji_items = sorted(
+                    kanji_entries,
+                    key=lambda row: first_map.get(row["character"], float("inf"))
+                )
+                num_columns = 4
                 cols = st.columns(num_columns)
                 st.markdown('<div class="kanji-card-container">', unsafe_allow_html=True)
                 for idx, kanji_info in enumerate(sorted_kanji_items):
@@ -2049,7 +2101,7 @@ def run_full_pipeline(url: str, force: bool):
                             h_mean = parts[1]
                         else:
                             k_desc = original_meaning
-                        html_c = f"""<div class="kanji-card"><div class="kanji-char-display">{kanji_info['character']}</div><div class="kanji-info"><div class="reading"><strong>Reading:</strong> <span class="value">{kanji_info['reading']}</span></div><div class="meaning-korean"><strong>Korean:</strong> <span class="value">{k_desc}</span></div>{'<div class="meaning-hanja"><strong>Hanja:</strong> <span class="value">' + h_mean + '</span></div>' if h_mean else ''}</div></div>"""
+                        html_c = f"""<div class="kanji-card"><div class="kanji-char-display">{kanji_info['character']}</div><div class="kanji-info"><div class="reading"><strong></strong> <span class="value">{kanji_info['reading']}</span></div><div class="meaning-korean"><strong></strong> <span class="value">{k_desc}</span></div>{'<div class="meaning-hanja"><strong></strong> <span class="value">' + h_mean + '</span></div>' if h_mean else ''}</div></div>"""
                         st.markdown(html_c, unsafe_allow_html=True)
                 st.markdown('</div>', unsafe_allow_html=True)
         
