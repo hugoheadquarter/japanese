@@ -202,7 +202,7 @@ def populate_transcript_tab(tab, video_dir: str, audio_fn: str, sync_json: str):
 
 
 def populate_breakdown_tab(tab, video_id: int, video_dir: str):
-    """Fill the breakdown tab with lazy-loaded segments."""
+    """Fill the breakdown tab with segments rendered directly (no expanders)."""
     with tab:
         segments = cached_segments(video_id)
         if not segments:
@@ -211,35 +211,31 @@ def populate_breakdown_tab(tab, video_id: int, video_dir: str):
 
         for seg in segments:
             seg_id = seg["id"]
-            seg_text = seg.get("text", "")
 
-            # Lazy rendering with expander
-            with st.expander(f"#{seg['segment_index']+1}: {seg_text[:40]}...", expanded=True):
-                analyses = cached_phrase_analyses(seg_id)
-                if not analyses:
-                    st.info("이 세그먼트에 대한 분석이 없습니다.")
-                    continue
+            analyses = cached_phrase_analyses(seg_id)
+            if not analyses:
+                continue
 
-                phrases_data = []
-                audio_map = {}
-                sync_map = {}
+            phrases_data = []
+            audio_map = {}
+            sync_map = {}
 
-                for a in analyses:
-                    idx = a["phrase_index_in_segment"]
-                    phrases_data.append(json.loads(a["gpt_phrase_json"]))
-                    audio_map[idx] = a.get("phrase_slowed_audio_path")
-                    sync_words = (
-                        json.loads(a["phrase_words_for_sync_json"])
-                        if a.get("phrase_words_for_sync_json")
-                        else []
-                    )
-                    sync_map[idx] = sync_words
-
-                html = generate_breakdown_html(
-                    phrases_data, audio_map, sync_map, video_dir, seg_id
+            for a in analyses:
+                idx = a["phrase_index_in_segment"]
+                phrases_data.append(json.loads(a["gpt_phrase_json"]))
+                audio_map[idx] = a.get("phrase_slowed_audio_path")
+                sync_words = (
+                    json.loads(a["phrase_words_for_sync_json"])
+                    if a.get("phrase_words_for_sync_json")
+                    else []
                 )
-                px = estimate_segment_height(phrases_data)
-                st.components.v1.html(html, height=px, scrolling=True)
+                sync_map[idx] = sync_words
+
+            html = generate_breakdown_html(
+                phrases_data, audio_map, sync_map, video_dir, seg_id
+            )
+            px = estimate_segment_height(phrases_data)
+            st.components.v1.html(html, height=px, scrolling=False)
 
 
 def populate_vocab_tab(tab, video_id: int, video_dir: str, audio_fn: str | None):
@@ -450,7 +446,7 @@ def run_full_pipeline(url: str, force: bool):
             status.error("스크립트 변환 실패.")
             return None
 
-        full_text, segments_list = prepare_japanese_segments(transcript)
+        full_text, segments_list, seg_debug = prepare_japanese_segments(transcript)
         if full_text is None:
             status.error("세그먼트 준비 실패.")
             return None
@@ -490,6 +486,11 @@ def run_full_pipeline(url: str, force: bool):
         with tab_json:
             st.json(transcript)
 
+        # --- Save segmentation debug immediately ---
+        seg_debug_path = video_dir_abs / "claude_segmentation.json"
+        with open(seg_debug_path, "w", encoding="utf-8") as f:
+            json.dump(seg_debug, f, ensure_ascii=False, indent=2)
+
         # --- STAGE 2: Claude analysis ---
         status.info("3단계: 구문 분석 시작...")
 
@@ -498,6 +499,8 @@ def run_full_pipeline(url: str, force: bool):
 
         vocab_map = {}
         total = len(segments_list)
+        all_claude_analyses = []  # Collect raw responses for debug file
+        analysis_debug_path = video_dir_abs / "claude_analyses.json"
 
         for i, seg in enumerate(segments_list):
             status.info(f"세그먼트 {i+1}/{total} 분석 중...")
@@ -514,6 +517,16 @@ def run_full_pipeline(url: str, force: bool):
                 seg["text"], seg["start"], seg["end"], seg["words"],
                 previous_context=prev_ctx,
             )
+
+            # Save raw response for debugging
+            all_claude_analyses.append({
+                "segment_index": i,
+                "segment_text": seg["text"],
+                "claude_response": analysis,
+            })
+            # Write incrementally so partial results survive if stopped early
+            with open(analysis_debug_path, "w", encoding="utf-8") as f:
+                json.dump(all_claude_analyses, f, ensure_ascii=False, indent=2)
 
             phrases = analysis.get("phrases", [])
             timings = [
@@ -558,11 +571,7 @@ def run_full_pipeline(url: str, force: bool):
                     phrases, audio_map, sync_map, video_dir, db_seg_id
                 )
                 px = estimate_segment_height(phrases)
-                st.components.v1.html(html, height=px, scrolling=True)
-                st.markdown(
-                    "<hr style='border-top:1.5px solid #ddd;margin:20px 0'>",
-                    unsafe_allow_html=True,
-                )
+                st.components.v1.html(html, height=px, scrolling=False)
 
         # --- STAGE 3: Kanji & Vocab ---
         status.info("4단계: 한자 추출 중...")

@@ -262,6 +262,15 @@ def generate_breakdown_html(
             video_dir_name, phrase_audio_map.get(i), phrase_sync_words_map.get(i, []), uid, kanji_map
         ))
 
+        font = '-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif'
+
+        # Korean meaning right below the Japanese phrase
+        if phrase.get("meaning"):
+            parts.append(
+                f"<div style='margin-top:0;margin-bottom:12px;font-family:{font};'>"
+                f"<p style='font-size:20px;line-height:1.6;margin:0;color:#555;'>{phrase['meaning']}</p></div>"
+            )
+
         # Build a lookup: for each word, find its kanji explanations (meaning only, no reading)
         kanji_explanations = phrase.get("kanji_explanations", [])
         ke_lookup = {}
@@ -274,7 +283,6 @@ def generate_breakdown_html(
         # Check if ANY word in the phrase has kanji
         has_any_kanji = any(w.get("kanji") for w in phrase.get("words", []))
 
-        font = '-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif'
         th_style = "border:1px solid #e0e0e0;padding:8px 12px;text-align:left;background-color:#f2f2f2;font-size:15px;"
         td_style = "border:1px solid #e0e0e0;padding:8px 12px;text-align:left;font-size:15px;"
 
@@ -293,29 +301,30 @@ def generate_breakdown_html(
             table += f"<td style='{td_style}'>{w.get('romaji', '')}</td>"
             table += f"<td style='{td_style}'>{w.get('meaning', '')}</td>"
             if has_any_kanji:
-                # Build kanji cell: each kanji char + its Korean meaning
+                # Build kanji cell: only actual kanji characters (filter out hiragana/katakana)
                 kanji_str = w.get("kanji", "")
                 if kanji_str:
                     kanji_parts = []
                     for ch in kanji_str:
+                        cp = ord(ch)
+                        is_kanji = (0x4E00 <= cp <= 0x9FFF) or (0x3400 <= cp <= 0x4DBF) or (0xF900 <= cp <= 0xFAFF)
+                        if not is_kanji:
+                            continue
                         m = ke_lookup.get(ch, "")
                         if m:
                             kanji_parts.append(f"<strong>{ch}</strong> <span style='color:#666;font-size:13px;'>{m}</span>")
                         else:
                             kanji_parts.append(f"<strong>{ch}</strong>")
-                    table += f"<td style='{td_style}'>{'<br>'.join(kanji_parts)}</td>"
+                    if kanji_parts:
+                        table += f"<td style='{td_style}'>{'<br>'.join(kanji_parts)}</td>"
+                    else:
+                        table += f"<td style='{td_style}'></td>"
                 else:
                     table += f"<td style='{td_style}'></td>"
             table += "</tr>"
 
         table += "</table>"
         parts.append(table)
-
-        if phrase.get("meaning"):
-            parts.append(
-                f"<div style='margin-top:5px;margin-bottom:15px;font-family:{font};'>"
-                f"<p style='font-size:20px;line-height:1.6;margin-top:0;'>{phrase['meaning']}</p></div>"
-            )
 
         if i < len(phrases_data) - 1:
             parts.append("<hr style='margin-top:15px;margin-bottom:15px;border:0;height:1px;background-color:#e0e0e0;'>")
@@ -324,10 +333,13 @@ def generate_breakdown_html(
 
 
 def estimate_segment_height(phrases: list[dict]) -> int:
-    total = 40
+    """Generous height estimate so content never gets clipped."""
+    total = 60
     for p in phrases:
-        total += 110 + 38 + 40 + max(1, len(p.get("words", []))) * 30
-    return max(200, min(total, 2000))
+        base = 160  # phrase player + meaning
+        word_rows = max(1, len(p.get("words", [])))
+        total += base + word_rows * 38 + 30  # 30 for hr
+    return max(300, total)
 
 
 # ---------------------------------------------------------------------------

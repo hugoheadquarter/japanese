@@ -193,28 +193,29 @@ with tab1:
         st.info("Audio or transcript data missing.")
 
 
-# Tab 2: Breakdown (lazy)
+# Tab 2: Breakdown (no expanders)
 with tab2:
     segments = _cached_segments(vid_id)
     for seg in segments:
         seg_id = seg["id"]
-        seg_text = seg.get("text", "")
-        with st.expander(f"#{seg['segment_index']+1}: {seg_text[:40]}...", expanded=True):
-            analyses = _cached_phrases(seg_id)
-            if not analyses:
-                continue
-            phrases_data = []
-            audio_map = {}
-            sync_map = {}
-            for a in analyses:
-                idx = a["phrase_index_in_segment"]
-                phrases_data.append(json.loads(a["gpt_phrase_json"]))
-                audio_map[idx] = a.get("phrase_slowed_audio_path")
-                sw = json.loads(a["phrase_words_for_sync_json"]) if a.get("phrase_words_for_sync_json") else []
-                sync_map[idx] = sw
-            html = generate_breakdown_html(phrases_data, audio_map, sync_map, video_dir, seg_id)
-            px = estimate_segment_height(phrases_data)
-            st.components.v1.html(html, height=px, scrolling=True)
+
+        analyses = _cached_phrases(seg_id)
+        if not analyses:
+            continue
+
+        phrases_data = []
+        audio_map = {}
+        sync_map = {}
+        for a in analyses:
+            idx = a["phrase_index_in_segment"]
+            phrases_data.append(json.loads(a["gpt_phrase_json"]))
+            audio_map[idx] = a.get("phrase_slowed_audio_path")
+            sw = json.loads(a["phrase_words_for_sync_json"]) if a.get("phrase_words_for_sync_json") else []
+            sync_map[idx] = sw
+
+        html = generate_breakdown_html(phrases_data, audio_map, sync_map, video_dir, seg_id)
+        px = estimate_segment_height(phrases_data)
+        st.components.v1.html(html, height=px, scrolling=False)
 
 
 # Tab 3 (vocab): 단어
