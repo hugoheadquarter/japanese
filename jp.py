@@ -480,20 +480,18 @@ Ensure your JSON is well-formed and follows this exact structure. Provide ONLY t
 def create_synchronized_player(audio_abs_path_str: str, words_for_sync_list: list, height=700):
     """
     Creates the main HTML5 player with synchronized text highlighting.
-    Audio path is absolute.
+    Updated with iOS Safari audio compatibility.
     """
     try:
         if not os.path.exists(audio_abs_path_str):
-            # For the main player, an error message in the UI is appropriate
             st.error(f"Main audio file not found: {audio_abs_path_str}")
-            return # Don't generate HTML if audio is missing
+            return
             
         with open(audio_abs_path_str, "rb") as f:
             audio_b64 = base64.b64encode(f.read()).decode()
         
         words_json = json.dumps(words_for_sync_list if words_for_sync_list else [])
         
-        # Using a more unique base ID for player elements to avoid any theoretical collisions
         player_instance_id = f"main-transcript-player-{int(time.time()*1000)}"
         audio_element_id = f"audio-{player_instance_id}"
         text_display_id = f"text-display-{player_instance_id}"
@@ -501,7 +499,18 @@ def create_synchronized_player(audio_abs_path_str: str, words_for_sync_list: lis
 
         html = f"""
         <div id="{container_id}" style="width: 100%; font-family: sans-serif;">
-            <audio id="{audio_element_id}" controls style="width: 100%;">
+            <!-- iOS Audio Unlock Button -->
+            <div id="ios-unlock-{player_instance_id}" style="text-align: center; margin-bottom: 10px;">
+                <button onclick="unlockAudioIOS_{player_instance_id}()" 
+                        style="padding: 10px 20px; background: #007AFF; color: white; border: none; border-radius: 8px; font-size: 16px; cursor: pointer;">
+                    🔊 Enable Audio for Mobile
+                </button>
+                <div id="audio-status-{player_instance_id}" style="margin-top: 5px; font-size: 14px; color: #666;">
+                    Tap to enable audio on iOS devices
+                </div>
+            </div>
+            
+            <audio id="{audio_element_id}" controls style="width: 100%;" preload="metadata">
                 <source src="data:audio/mp3;base64,{audio_b64}" type="audio/mp3">
                 Your browser does not support the audio element.
             </audio>
@@ -512,30 +521,107 @@ def create_synchronized_player(audio_abs_path_str: str, words_for_sync_list: lis
         </div>
 
         <script>
-        (function() {{ // IIFE to encapsulate scope
+        (function() {{
             "use strict";
             const wordsData = {words_json};
             const audioPlayer = document.getElementById('{audio_element_id}');
             const textDisplay = document.getElementById('{text_display_id}');
+            const unlockButton = document.getElementById('ios-unlock-{player_instance_id}');
+            const audioStatus = document.getElementById('audio-status-{player_instance_id}');
 
             if (!audioPlayer || !textDisplay) {{
-                console.error("Main synchronized player elements not found: {audio_element_id} or {text_display_id}");
+                console.error("Main synchronized player elements not found");
                 return;
             }}
 
-            if (!wordsData || wordsData.length === 0) {{
-                // textDisplay.innerHTML = "<p style='color:grey;text-align:center;'>No transcript words to display.</p>"; // Already handled by Python conditional rendering
-                return; // No words, no player logic needed
+            let audioUnlocked = false;
+            let isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
+
+            // iOS Audio Unlock Function
+            window.unlockAudioIOS_{player_instance_id} = function() {{
+                if (audioUnlocked) {{
+                    audioStatus.innerHTML = '<span style="color: green;">✓ Audio already enabled</span>';
+                    return;
+                }}
+
+                audioStatus.innerHTML = '<span style="color: blue;">Enabling audio...</span>';
+                
+                // Try to play and immediately pause to unlock
+                const playPromise = audioPlayer.play();
+                if (playPromise !== undefined) {{
+                    playPromise.then(() => {{
+                        audioPlayer.pause();
+                        audioPlayer.currentTime = 0;
+                        audioUnlocked = true;
+                        audioStatus.innerHTML = '<span style="color: green;">✓ Audio enabled! Click words to play</span>';
+                        unlockButton.style.display = 'none';
+                        console.log('iOS audio unlocked successfully');
+                    }}).catch(error => {{
+                        console.error('Audio unlock failed:', error);
+                        audioStatus.innerHTML = '<span style="color: red;">⚠️ Audio unlock failed. Try using the built-in controls first.</span>';
+                    }});
+                }}
+            }};
+
+            // Auto-hide unlock button on non-iOS or after successful unlock
+            if (!isIOS) {{
+                unlockButton.style.display = 'none';
+                audioStatus.innerHTML = '<span style="color: green;">Ready</span>';
+                audioUnlocked = true;
             }}
 
-            // Groups words into logical phrases for display
+            if (!wordsData || wordsData.length === 0) {{
+                return; 
+            }}
+
+            // Enhanced play function with iOS compatibility
+            function playAudioAtTime(startTime, retryElement = null) {{
+                if (!audioUnlocked && isIOS) {{
+                    audioStatus.innerHTML = '<span style="color: orange;">Please enable audio first using the button above</span>';
+                    return false;
+                }}
+
+                try {{
+                    audioPlayer.currentTime = startTime;
+                    const playPromise = audioPlayer.play();
+                    
+                    if (playPromise !== undefined) {{
+                        playPromise.then(() => {{
+                            audioStatus.innerHTML = '<span style="color: blue;">▶️ Playing</span>';
+                        }}).catch(error => {{
+                            console.warn('Audio play failed:', error);
+                            if (retryElement && isIOS) {{
+                                // Add retry instruction for iOS
+                                const retryMsg = document.createElement('div');
+                                retryMsg.innerHTML = '<small style="color: #007AFF;">Tap again to play</small>';
+                                retryMsg.style.position = 'absolute';
+                                retryMsg.style.background = 'white';
+                                retryMsg.style.padding = '2px 5px';
+                                retryMsg.style.borderRadius = '3px';
+                                retryMsg.style.fontSize = '10px';
+                                retryElement.appendChild(retryMsg);
+                                
+                                setTimeout(() => retryMsg.remove(), 3000);
+                            }}
+                            audioStatus.innerHTML = '<span style="color: orange;">Tap word again or use player controls</span>';
+                            return false;
+                        }});
+                    }}
+                    return true;
+                }} catch (e) {{
+                    console.error('Audio play error:', e);
+                    audioStatus.innerHTML = '<span style="color: red;">Audio error</span>';
+                    return false;
+                }}
+            }}
+
             function formatTextIntoPhrases(wordsArray) {{
                 let phrases = [];
                 let currentPhraseWords = [];
                 let lastWordEndTime = 0;
 
                 wordsArray.forEach((word, index) => {{
-                    const isConnectedToPrevious = index > 0 && Math.abs(word.start - lastWordEndTime) < 0.3; // Small gap = connected
+                    const isConnectedToPrevious = index > 0 && Math.abs(word.start - lastWordEndTime) < 0.3;
                     const containsPunctuation = ['。', '、', '！', '？'].some(p => word.text.includes(p));
                     
                     currentPhraseWords.push(word);
@@ -549,16 +635,16 @@ def create_synchronized_player(audio_abs_path_str: str, words_for_sync_list: lis
                     }}
                 }});
 
-                if (currentPhraseWords.length > 0) {{ // Add any remaining words
+                if (currentPhraseWords.length > 0) {{
                     phrases.push(currentPhraseWords);
                 }}
 
-                // Optional: Merge very short phrases (e.g., <= 3 chars) with the next one
+                // Merge very short phrases
                 let mergedPhrases = [];
                 for (let i = 0; i < phrases.length; i++) {{
                     const currentPhraseText = phrases[i].map(w => w.text).join('');
                     if (currentPhraseText.length <= 3 && i < phrases.length - 1) {{
-                        phrases[i+1] = [...phrases[i], ...phrases[i+1]]; // Prepend short phrase to next
+                        phrases[i+1] = [...phrases[i], ...phrases[i+1]];
                     }} else {{
                         mergedPhrases.push(phrases[i]);
                     }}
@@ -566,35 +652,33 @@ def create_synchronized_player(audio_abs_path_str: str, words_for_sync_list: lis
                 return mergedPhrases;
             }}
 
-            // Renders the transcript text as clickable spans
             function renderTranscriptText() {{
-                textDisplay.innerHTML = ''; // Clear previous content
+                textDisplay.innerHTML = '';
                 const displayPhrases = formatTextIntoPhrases(wordsData);
                 let overallWordCounter = 0;
 
                 displayPhrases.forEach((phraseWords) => {{
                     const phraseContainerDiv = document.createElement('div');
-                    phraseContainerDiv.style.marginBottom = '10px'; // Spacing between phrases
+                    phraseContainerDiv.style.marginBottom = '10px';
 
                     phraseWords.forEach((wordObj) => {{
                         const wordSpanElement = document.createElement('span');
                         wordSpanElement.textContent = wordObj.text;
-                        // Use a consistent IDing scheme, referencing the overall word index
                         wordSpanElement.id = `word-{player_instance_id}-${{overallWordCounter}}`;
+                        wordSpanElement.style.position = 'relative'; // For retry messages
                         overallWordCounter++;
                         
                         wordSpanElement.style.cursor = 'pointer';
                         wordSpanElement.style.transition = 'color 0.2s ease-in-out, font-weight 0.2s ease-in-out';
                         
                         wordSpanElement.onclick = () => {{
-                            audioPlayer.currentTime = wordObj.start; // Seek audio
-                            audioPlayer.play().catch(e => console.warn("Audio play failed:", e));
+                            playAudioAtTime(wordObj.start, wordSpanElement);
                         }};
                         
-                        // NEW CODE: Add double-click handler to pause playback
                         wordSpanElement.ondblclick = (event) => {{
-                            event.preventDefault(); // Prevent text selection
-                            audioPlayer.pause(); // Pause the audio
+                            event.preventDefault();
+                            audioPlayer.pause();
+                            audioStatus.innerHTML = '<span style="color: green;">Paused</span>';
                         }};
                         
                         phraseContainerDiv.appendChild(wordSpanElement);
@@ -603,24 +687,23 @@ def create_synchronized_player(audio_abs_path_str: str, words_for_sync_list: lis
                 }});
             }}
 
-            // Updates word highlighting based on audio playback time
             function updateWordHighlights() {{
                 const currentTime = audioPlayer.currentTime;
                 let activeWordDOMElement = null;
                 let overallWordCounter = 0;
-                const displayPhrases = formatTextIntoPhrases(wordsData); // Re-get phrases to iterate consistently
+                const displayPhrases = formatTextIntoPhrases(wordsData);
 
                 displayPhrases.forEach((phraseWords) => {{
                     phraseWords.forEach((wordObj) => {{
                         const wordElement = document.getElementById(`word-{player_instance_id}-${{overallWordCounter}}`);
                         overallWordCounter++;
                         if (wordElement) {{
-                            if (currentTime >= wordObj.start && currentTime < wordObj.end) {{ // Use < end for clearer highlighting
-                                wordElement.style.color = '#ff4b4b'; // Highlight color
+                            if (currentTime >= wordObj.start && currentTime < wordObj.end) {{
+                                wordElement.style.color = '#ff4b4b';
                                 wordElement.style.fontWeight = 'bold';
                                 activeWordDOMElement = wordElement;
                             }} else {{
-                                wordElement.style.color = ''; // Reset style
+                                wordElement.style.color = '';
                                 wordElement.style.fontWeight = 'normal';
                             }}
                         }}
@@ -632,9 +715,7 @@ def create_synchronized_player(audio_abs_path_str: str, words_for_sync_list: lis
                     const displayRect = textDisplay.getBoundingClientRect();
                     const wordRect = activeWordDOMElement.getBoundingClientRect();
 
-                    // Scroll if the active word is not (mostly) visible
                     if (wordRect.top < displayRect.top + 30 || wordRect.bottom > displayRect.bottom - 30) {{
-                        // Scroll to center the word, or just bring into view
                         textDisplay.scrollTop += (wordRect.top - displayRect.top) - (displayRect.height / 2) + (wordRect.height / 2);
                     }}
                 }}
@@ -643,11 +724,10 @@ def create_synchronized_player(audio_abs_path_str: str, words_for_sync_list: lis
             // Initialize
             renderTranscriptText();
             audioPlayer.addEventListener('timeupdate', updateWordHighlights);
-            // Optional: Handle audio end to remove highlights
             audioPlayer.addEventListener('ended', () => {{
-                 const displayPhrases = formatTextIntoPhrases(wordsData);
-                 let overallWordCounter = 0;
-                 displayPhrases.forEach((phraseWords) => {{
+                const displayPhrases = formatTextIntoPhrases(wordsData);
+                let overallWordCounter = 0;
+                displayPhrases.forEach((phraseWords) => {{
                     phraseWords.forEach(() => {{
                         const wordElement = document.getElementById(`word-{player_instance_id}-${{overallWordCounter}}`);
                         if(wordElement) {{
@@ -656,7 +736,20 @@ def create_synchronized_player(audio_abs_path_str: str, words_for_sync_list: lis
                         }}
                         overallWordCounter++;
                     }});
-                 }});
+                }});
+                audioStatus.innerHTML = '<span style="color: green;">Ready</span>';
+            }});
+
+            // Audio event listeners for status updates
+            audioPlayer.addEventListener('play', () => {{
+                audioStatus.innerHTML = '<span style="color: blue;">▶️ Playing</span>';
+            }});
+            audioPlayer.addEventListener('pause', () => {{
+                audioStatus.innerHTML = '<span style="color: green;">Ready</span>';
+            }});
+            audioPlayer.addEventListener('error', (e) => {{
+                console.error('Main audio error:', e);
+                audioStatus.innerHTML = '<span style="color: red;">⚠️ Audio error</span>';
             }});
 
         }})();
@@ -668,11 +761,10 @@ def create_synchronized_player(audio_abs_path_str: str, words_for_sync_list: lis
 
 def create_phrase_synchronized_player(phrase_audio_abs_path_str: str,
                                       phrase_words_for_sync_list: list,
-                                      phrase_unique_id: str, # e.g., "S1_P0"
+                                      phrase_unique_id: str,
                                       kanji_map_for_js_str: str):
     """
-    Creates HTML/JS for an individual phrase player.
-    Audio element is hidden by global CSS. Text display div has explicit font-family.
+    Creates HTML/JS for an individual phrase player with iOS compatibility.
     """
     try:
         audio_b64 = ""
@@ -684,75 +776,83 @@ def create_phrase_synchronized_player(phrase_audio_abs_path_str: str,
         
         words_json = json.dumps(phrase_words_for_sync_list if phrase_words_for_sync_list else [])
         
-        # Element IDs using the unique phrase ID
         player_container_id = f"player-container-phrase-{phrase_unique_id}"
         audio_element_id = f"audio-player-phrase-{phrase_unique_id}"
         text_display_id = f"text-display-phrase-{phrase_unique_id}"
+        status_id = f"phrase-status-{phrase_unique_id}"
 
         audio_html_tag = ""
         if audio_available:
-            # The audio tag is hidden by global CSS (e.g., .phrase-player audio[id^="audio-player-phrase-"])
             audio_html_tag = f"""
-            <audio id="{audio_element_id}" loop>
+            <audio id="{audio_element_id}" loop preload="metadata">
                 <source src="data:audio/mp3;base64,{audio_b64}" type="audio/mp3">
             </audio>
             """
         
-        # Phrase text will be populated by JavaScript.
-        # Explicit font-family for the main phrase text display.
         html_content = f"""
         <div id="{player_container_id}" class="phrase-player">
+            <!-- iOS Status for this phrase -->
+            <div id="{status_id}" style="font-size: 12px; color: #666; margin-bottom: 5px; text-align: center;"></div>
+            
             {audio_html_tag}
             <div id="{text_display_id}" 
                  style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, 'Open Sans', 'Helvetica Neue', sans-serif; 
                         font-size:30px; 
                         line-height:1.8; 
                         padding: 5px 10px;
-                        cursor: pointer;">
+                        cursor: pointer;
+                        position: relative;">
                 {'' if phrase_words_for_sync_list else '<p style="font-size:16px; color:grey; text-align:center;">No text for this phrase.</p>'}
             </div>
         </div>
 
         <script>
-        (function() {{ // IIFE for encapsulation
+        (function() {{
             "use strict";
             
-            // ─── Global guard so only one phrase can play at a time ─────────────
+            // Global phrase audio manager
             if (!window.__phraseAudioManager) {{
               window.__phraseAudioManager = {{
-                currentAudio: null,     // <audio> element that is playing
-                clearFn:     null,      // function that removes its highlights
+                currentAudio: null,
+                clearFn: null,
+                audioUnlocked: false,  // Global iOS unlock state
                 stopCurrent() {{
                   if (this.currentAudio) {{
                     try {{ this.currentAudio.pause(); }} catch(e) {{}}
                   }}
                   if (this.clearFn) {{ this.clearFn(); }}
                   this.currentAudio = null;
-                  this.clearFn     = null;
+                  this.clearFn = null;
                 }}
               }};
             }}
             
             const wordsDataPhrase = {words_json};
-            const kanjiReadingsMap = JSON.parse('{kanji_map_for_js_str}'); // Parse the JSON string
-            const audioPlayerPhrase = document.getElementById('{audio_element_id}'); // Might be null
+            const kanjiReadingsMap = JSON.parse('{kanji_map_for_js_str}');
+            const audioPlayerPhrase = document.getElementById('{audio_element_id}');
             const textDisplayPhrase = document.getElementById('{text_display_id}');
+            const phraseStatus = document.getElementById('{status_id}');
+            const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
 
             if (!textDisplayPhrase) {{
-                console.error("Text display element not found for phrase player: {text_display_id}");
+                console.error("Text display element not found for phrase player");
                 return;
             }}
 
             if (!wordsDataPhrase || wordsDataPhrase.length === 0) {{
-                // textDisplayPhrase.innerHTML = "<p style='font-size:16px; color:grey; text-align:center;'>No text for this phrase.</p>"; // Already handled by Python
                 return; 
             }}
             
-            // helper that resets *this* phrase's word colours
             function clearHighlightsLocal() {{
               wordsDataPhrase.forEach((_, idx) => {{
                 const el = document.getElementById(`word-phrase-{phrase_unique_id}-word-${{idx}}`);
-                if (el) {{ el.style.color = ''; el.style.fontWeight = 'normal'; }}
+                if (el) {{ 
+                    el.style.color = ''; 
+                    el.style.fontWeight = 'normal'; 
+                    // Remove any retry messages
+                    const retry = el.querySelector('.retry-msg');
+                    if (retry) retry.remove();
+                }}
               }});
             }}
 
@@ -780,42 +880,109 @@ def create_phrase_synchronized_player(phrase_audio_abs_path_str: str,
                 return htmlOutput;
             }}
 
+            function playPhraseAudio(startTime, clickedElement) {{
+                if (!audioPlayerPhrase) {{ 
+                    return false; 
+                }}
+                
+                // Check if audio is unlocked for iOS
+                if (!window.__phraseAudioManager.audioUnlocked && isIOS) {{
+                    // Try to unlock audio
+                    const unlockPromise = audioPlayerPhrase.play();
+                    if (unlockPromise !== undefined) {{
+                        unlockPromise.then(() => {{
+                            audioPlayerPhrase.pause();
+                            audioPlayerPhrase.currentTime = 0;
+                            window.__phraseAudioManager.audioUnlocked = true;
+                            phraseStatus.innerHTML = '<span style="color: green;">✓ Audio enabled</span>';
+                            
+                            // Now try the actual playback
+                            setTimeout(() => playPhraseAudio(startTime, clickedElement), 100);
+                        }}).catch(error => {{
+                            console.log('iOS audio unlock failed for phrase:', error);
+                            phraseStatus.innerHTML = '<span style="color: orange;">Use player controls or tap again</span>';
+                            
+                            // Add visual feedback
+                            if (clickedElement) {{
+                                const existing = clickedElement.querySelector('.retry-msg');
+                                if (!existing) {{
+                                    const retryMsg = document.createElement('div');
+                                    retryMsg.className = 'retry-msg';
+                                    retryMsg.innerHTML = '<small style="color: #007AFF;">Tap again</small>';
+                                    retryMsg.style.position = 'absolute';
+                                    retryMsg.style.background = 'rgba(255,255,255,0.9)';
+                                    retryMsg.style.padding = '2px 4px';
+                                    retryMsg.style.borderRadius = '3px';
+                                    retryMsg.style.fontSize = '10px';
+                                    retryMsg.style.top = '-15px';
+                                    retryMsg.style.left = '0';
+                                    clickedElement.style.position = 'relative';
+                                    clickedElement.appendChild(retryMsg);
+                                    
+                                    setTimeout(() => retryMsg.remove(), 2000);
+                                }}
+                            }}
+                            return false;
+                        }});
+                    }}
+                    return false;
+                }}
+
+                // Stop other phrases
+                window.__phraseAudioManager.stopCurrent();
+                
+                // Register this phrase
+                window.__phraseAudioManager.currentAudio = audioPlayerPhrase;
+                window.__phraseAudioManager.clearFn = clearHighlightsLocal;
+                
+                // Play audio
+                try {{
+                    audioPlayerPhrase.currentTime = startTime;
+                    const playPromise = audioPlayerPhrase.play();
+                    
+                    if (playPromise !== undefined) {{
+                        playPromise.then(() => {{
+                            phraseStatus.innerHTML = '<span style="color: blue;">▶️ Playing phrase</span>';
+                        }}).catch(e => {{
+                            console.warn('Phrase audio play failed:', e);
+                            phraseStatus.innerHTML = '<span style="color: orange;">Audio blocked - use controls</span>';
+                        }});
+                    }}
+                    return true;
+                }} catch (e) {{
+                    console.error('Phrase play error:', e);
+                    phraseStatus.innerHTML = '<span style="color: red;">Error</span>';
+                    return false;
+                }}
+            }}
+
             function renderPhraseText() {{
-                textDisplayPhrase.innerHTML = ''; // Clear previous
+                textDisplayPhrase.innerHTML = '';
                 const phraseWordsContainer = document.createElement('div');
 
                 wordsDataPhrase.forEach((wordObj, index) => {{
                     const wordSpan = document.createElement('span');
                     wordSpan.innerHTML = generateFuriganaHTML(wordObj.text, kanjiReadingsMap);
-                    wordSpan.id = `word-phrase-{phrase_unique_id}-word-${{index}}`; // Unique ID for each word span
+                    wordSpan.id = `word-phrase-{phrase_unique_id}-word-${{index}}`;
                     wordSpan.style.cursor = 'pointer';
                     wordSpan.style.transition = 'color 0.2s ease-in-out, font-weight 0.2s ease-in-out';
-                    wordSpan.style.marginRight = '2px'; // Small spacing between words
+                    wordSpan.style.marginRight = '2px';
+                    wordSpan.style.position = 'relative'; // For retry messages
 
                     wordSpan.onclick = () => {{
-                        if (!audioPlayerPhrase) {{ return; }}
-                        
-                        /* ① stop whatever is playing elsewhere */
-                        window.__phraseAudioManager.stopCurrent();
-                        
-                        /* ② register this phrase as the new "current" */
-                        window.__phraseAudioManager.currentAudio = audioPlayerPhrase;
-                        window.__phraseAudioManager.clearFn = clearHighlightsLocal;
-                        
-                        /* ③ start playback */
-                        audioPlayerPhrase.currentTime = wordObj.start;
-                        audioPlayerPhrase.play().catch(e => console.warn('Phrase audio play failed:', e));
+                        playPhraseAudio(wordObj.start, wordSpan);
                     }};
+                    
                     wordSpan.ondblclick = (event) => {{
-                        event.preventDefault(); // Prevent text selection
+                        event.preventDefault();
                         if (audioPlayerPhrase) {{
                             audioPlayerPhrase.pause();
                             
-                            // Also clear from manager if this is the current audio
                             if (window.__phraseAudioManager.currentAudio === audioPlayerPhrase) {{
                                 window.__phraseAudioManager.currentAudio = null;
                                 window.__phraseAudioManager.clearFn = null;
                             }}
+                            phraseStatus.innerHTML = '<span style="color: green;">Paused</span>';
                         }}
                     }};
                     phraseWordsContainer.appendChild(wordSpan);
@@ -825,13 +992,13 @@ def create_phrase_synchronized_player(phrase_audio_abs_path_str: str,
 
             function updatePhraseWordHighlights() {{
                 if (!audioPlayerPhrase || !wordsDataPhrase || wordsDataPhrase.length === 0) {{
-                    return; // No audio or no words, nothing to highlight
+                    return;
                 }}
                 const currentTime = audioPlayerPhrase.currentTime;
                 wordsDataPhrase.forEach((wordObj, index) => {{
                     const wordElement = document.getElementById(`word-phrase-{phrase_unique_id}-word-${{index}}`);
                     if (wordElement) {{
-                        if (currentTime >= wordObj.start && currentTime < wordObj.end) {{ // Use < end
+                        if (currentTime >= wordObj.start && currentTime < wordObj.end) {{
                             wordElement.style.color = '#ff4b4b';
                             wordElement.style.fontWeight = 'bold';
                         }} else {{
@@ -842,21 +1009,29 @@ def create_phrase_synchronized_player(phrase_audio_abs_path_str: str,
                 }});
             }}
             
-            // Initial setup
+            // Initialize phrase player
             try {{
                 renderPhraseText();
-                if (audioPlayerPhrase) {{ // Add event listeners only if audio element is present
+                if (audioPlayerPhrase) {{
                     audioPlayerPhrase.addEventListener('timeupdate', updatePhraseWordHighlights);
-                    audioPlayerPhrase.addEventListener('ended', () => {{ // Clear highlights on end
+                    audioPlayerPhrase.addEventListener('ended', () => {{
                         clearHighlightsLocal();
                         if (window.__phraseAudioManager.currentAudio === audioPlayerPhrase) {{
                             window.__phraseAudioManager.currentAudio = null;
                             window.__phraseAudioManager.clearFn = null;
                         }}
+                        phraseStatus.innerHTML = '<span style="color: green;">Ready</span>';
                     }});
+                    
+                    // Set initial status
+                    if (isIOS && !window.__phraseAudioManager.audioUnlocked) {{
+                        phraseStatus.innerHTML = '<span style="color: #666;">Tap text to enable audio</span>';
+                    }} else {{
+                        phraseStatus.innerHTML = '<span style="color: green;">Ready</span>';
+                    }}
                 }}
             }} catch (e) {{
-                console.error("Error setting up phrase player ({phrase_unique_id}):", e);
+                console.error("Error setting up phrase player:", e);
                 textDisplayPhrase.innerHTML = "<p style='color:red;font-size:14px;'>Error initializing player.</p>";
             }}
         }})();
@@ -864,7 +1039,6 @@ def create_phrase_synchronized_player(phrase_audio_abs_path_str: str,
         """
         return html_content
     except Exception as e:
-        # Python-side error during HTML string generation
         print(f"Python error during create_phrase_synchronized_player for {phrase_unique_id}: {str(e)}")
         return f"""<div class="phrase-player"><p style="color:red;text-align:center;padding:10px;">Error generating player for phrase {phrase_unique_id}.</p></div>"""
 
@@ -948,13 +1122,6 @@ def extract_and_store_kanji_for_video(conn, video_id):
         except sqlite3.IntegrityError: pass
     conn.commit()
 
-# ─────────────────────────────────────────────────────────────
-#  Kanji-to-timing mapper (final version with absolute offset)
-# ─────────────────────────────────────────────────────────────
-# ──────────────────────────────────────────────────────────────
-#  Final timing-aware vocabulary collector
-# ──────────────────────────────────────────────────────────────
-# ────────────────────────────────────────────────────────────────
 def collect_vocab_with_kanji(gpt_json, vocab_map, phrase_sync_words=None):
     """
     Insert / update kanji words from GPT analysis, *with real timings*.
@@ -1043,10 +1210,6 @@ def collect_vocab_with_kanji(gpt_json, vocab_map, phrase_sync_words=None):
                     "end": end,
                 }
 
-
-
-
-
 def find_audio_file_for_video(video_id, video_dir_name):
     """
     Attempts to find the audio file using multiple methods if the standard path resolution fails.
@@ -1104,23 +1267,14 @@ def find_audio_file_for_video(video_id, video_dir_name):
 
 def create_vocab_component(vocab_map, full_slowed_audio_path, filter_query="", sort_by="일본어순"):
     """
-    Generate a complete self-contained HTML component for vocabulary with proper audio playback.
-    
-    Args:
-        vocab_map: Dictionary of vocabulary words with their details
-        full_slowed_audio_path: Path to the slowed audio file
-        filter_query: Optional filter for vocabulary words
-        sort_by: Sort method ("일본어순" or "한자순")
-        
-    Returns:
-        String containing complete HTML component
+    Generate vocabulary component with iOS Safari compatibility.
     """
     # Sort and filter vocabulary items
     if sort_by == "일본어순":
         sorted_items = sorted(vocab_map.items())
     elif sort_by == "한자순":
         sorted_items = sorted(vocab_map.items(), key=lambda x: x[1]["kanji"])
-    else:                             # 시간순  ← default branch
+    else:  # 시간순
         sorted_items = sorted(
             vocab_map.items(),
             key=lambda kv: (
@@ -1135,10 +1289,8 @@ def create_vocab_component(vocab_map, full_slowed_audio_path, filter_query="", s
                                filter_query.lower() in info["meaning"].lower())
     ]
     
-    # Complete HTML content with CSS, audio, cards, and JavaScript in ONE component
     html_content = """
     <style>
-    /* CSS styles for vocabulary cards */
     .vocab-card {
         border: 1px solid #e0e0e0;
         border-radius: 8px;
@@ -1149,6 +1301,7 @@ def create_vocab_component(vocab_map, full_slowed_audio_path, filter_query="", s
         transition: box-shadow 0.2s, transform 0.2s;
         text-align: center;
         cursor: pointer;
+        position: relative;
     }
     .vocab-card:hover {
         box-shadow: 0 4px 8px rgba(0,0,0,0.1);
@@ -1182,17 +1335,23 @@ def create_vocab_component(vocab_map, full_slowed_audio_path, filter_query="", s
         gap: 15px;
         padding: 10px;
     }
-    .debug-info {
-        color: #999;
-        font-size: 10px;
-        margin-top: 5px;
-    }
     .control-panel {
         text-align: center;
         margin-bottom: 15px;
         padding: 10px;
         background: #f8f8f8;
         border-radius: 8px;
+    }
+    .ios-unlock-btn {
+        display: inline-block;
+        padding: 10px 20px;
+        background-color: #007AFF;
+        color: white;
+        font-size: 16px;
+        border-radius: 8px;
+        margin: 5px;
+        cursor: pointer;
+        border: none;
     }
     .stop-button {
         display: inline-block;
@@ -1205,77 +1364,70 @@ def create_vocab_component(vocab_map, full_slowed_audio_path, filter_query="", s
         cursor: pointer;
         border: none;
     }
-    .play-all-button {
-        display: inline-block;
-        padding: 6px 12px;
-        background-color: #4CAF50;
-        color: white;
-        font-size: 14px;
-        border-radius: 4px;
-        margin: 5px;
-        cursor: pointer;
-        border: none;
-    }
     .audio-status {
-        display: inline-block;
-        margin-left: 10px;
+        display: block;
+        margin-top: 8px;
         font-size: 14px;
     }
     .timing-missing {
         border: 1px dashed #ff9800 !important;
     }
+    .retry-instruction {
+        position: absolute;
+        top: -20px;
+        left: 50%;
+        transform: translateX(-50%);
+        background: rgba(0, 122, 255, 0.9);
+        color: white;
+        padding: 4px 8px;
+        border-radius: 4px;
+        font-size: 12px;
+        white-space: nowrap;
+        z-index: 10;
+    }
     </style>
     
-    <div id="debug-output" style="display:none;"></div>
-    
-    <!-- Control panel with status indicator -->
+    <!-- Control panel with iOS unlock -->
     <div class="control-panel">
-        <button onclick="stopVocab()" class="stop-button">Stop</button>
-        <span id="audio-status" class="audio-status">Initializing audio...</span>
+        <button id="ios-unlock-vocab" onclick="unlockVocabAudioIOS()" class="ios-unlock-btn">
+            🔊 Enable Audio for Mobile
+        </button>
+        <button onclick="stopVocab()" class="stop-button">Stop All Audio</button>
+        <div id="vocab-audio-status" class="audio-status">Tap "Enable Audio" first on mobile devices</div>
     </div>
     """
     
-    # Add the audio element with more robust error handling
+    # Add the audio element
     if full_slowed_audio_path and os.path.exists(full_slowed_audio_path):
         try:
             with open(full_slowed_audio_path, 'rb') as audio_file:
-                audio_size = os.path.getsize(full_slowed_audio_path)
                 audio_b64 = base64.b64encode(audio_file.read()).decode()
                 html_content += f"""
-                <audio id="vocab-player" preload="auto">
+                <audio id="vocab-player" preload="metadata">
                     <source src="data:audio/mp3;base64,{audio_b64}" type="audio/mp3">
                     Your browser does not support the audio element.
                 </audio>
-                <div style="color:green; padding:5px; margin:5px 0; background:#f0fff0; border-radius:4px; display:none;">
-                    Audio file loaded successfully: {os.path.basename(full_slowed_audio_path)} ({audio_size/1024/1024:.2f} MB)
-                </div>
                 """
         except Exception as e:
-            error_message = str(e)
             html_content += f"""
             <div style="color:red; padding:10px; margin-bottom:15px; background:#fff0f0; border-radius:4px;">
-                Audio loading error: {error_message}
-                <div style="font-size:12px; margin-top:5px;">Path: {full_slowed_audio_path}</div>
+                Audio loading error: {e}
             </div>
             <audio id="vocab-player"></audio>
             """
     else:
         html_content += f"""
         <div style="color:orange; padding:10px; margin-bottom:15px; background:#fff8e1; border-radius:4px;">
-            No audio file available for this video.
-            <div style="font-size:12px; margin-top:5px;">
-                Path checked: {full_slowed_audio_path if full_slowed_audio_path else "None"}
-                <br>Path exists: {os.path.exists(full_slowed_audio_path) if full_slowed_audio_path else "False"}
-            </div>
+            No audio file available
         </div>
         <audio id="vocab-player"></audio>
         """
     
-    # Add vocabulary cards grid with timing data
+    # Add vocabulary cards grid
     html_content += '<div class="vocab-grid">'
     
     for jp, info in filtered_items:
-        # Create furigana HTML for display
+        # Create furigana HTML
         jp_with_furigana = jp
         kanji_readings = info.get("kanji_readings", {})
         if kanji_readings:
@@ -1286,128 +1438,149 @@ def create_vocab_component(vocab_map, full_slowed_audio_path, filter_query="", s
                         f'<ruby>{kanji}<rt>{reading}</rt></ruby>'
                     )
         
-        # IMPORTANT FIX: Always include data attributes, with defaults if actual timing is missing
         start_time = info.get("start")
         end_time = info.get("end")
         has_timing = start_time is not None and end_time is not None
         
-        # Include data attributes even if the values are "null" - better for debugging
-        # JavaScript can handle null values, but missing attributes cause more problems
         start_attr = f'data-start="{start_time}"'
         end_attr = f'data-end="{end_time}"'
-        
-        # Add a class to visually indicate cards with missing timing
         timing_class = "" if has_timing else "timing-missing"
         
-        # Add debug timing display for troubleshooting
-        #debug_timing = f'<div class="debug-info">{start_time}s - {end_time}s</div>' if has_timing else '<div class="debug-info">No timing data</div>'
-        debug_timing = ""
         html_content += f"""
         <div class="vocab-card {timing_class}" {start_attr} {end_attr} onclick="playVocab(this)">
             <div class="vocab-japanese">{jp_with_furigana}</div>
             <div class="vocab-meaning">{info["meaning"]}</div>
-            {debug_timing}
         </div>
         """
     
     html_content += '</div>'
     
-    # Add improved JavaScript with better error handling and debugging
+    # Enhanced JavaScript with iOS compatibility
     html_content += """
     <script>
     (function() {
-        // Use let/const for variables to keep them in this closure
         const player = document.getElementById('vocab-player');
-        const audioStatus = document.getElementById('audio-status');
+        const audioStatus = document.getElementById('vocab-audio-status');
+        const unlockButton = document.getElementById('ios-unlock-vocab');
         let stopTimeout = null;
         let currentPlayingCard = null;
+        let vocabAudioUnlocked = false;
+        const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
         
-        // Log initial state to help debugging
-        console.log("Audio player on initialization:", player);
-        
-        // Check if player has a source
-        function checkAudioSource() {
-            if (player) {
-                const source = player.querySelector('source');
-                if (source && source.src) {
-                    console.log("Audio source found:", source.src.substring(0, 50) + "...");
-                    return true;
-                } else {
-                    console.warn("Audio element exists but has no source");
-                    return false;
-                }
+        // Global vocab audio unlock function
+        window.unlockVocabAudioIOS = function() {
+            if (vocabAudioUnlocked) {
+                audioStatus.innerHTML = '<span style="color:green;">✓ Audio already enabled</span>';
+                return;
             }
-            return false;
-        }
-        
-        // Update status based on player and source
-        if (player) {
-            audioStatus.innerHTML = '<span style="color:green">✓ Audio player found</span>';
-            
-            if (checkAudioSource()) {
-                audioStatus.innerHTML = '<span style="color:green">✓ Audio ready</span>';
-            } else {
-                audioStatus.innerHTML = '<span style="color:orange">⚠️ Audio source missing</span>';
-            }
-            
-            // Set up error handling for the audio element
-            player.addEventListener('error', function(e) {
-                console.error("Audio element error:", e);
-                audioStatus.innerHTML = '<span style="color:red">⚠️ Audio error: ' + 
-                    (player.error ? player.error.message : 'unknown') + '</span>';
-            });
-        } else {
-            console.error("Audio player element not found!");
-            audioStatus.innerHTML = '<span style="color:red">⚠️ Audio player not found!</span>';
-        }
-        
-        window.playVocab = function (card) {
-            console.log("Card clicked:", card);
-            console.log("Audio player when clicked:", player);
 
             if (!player) {
-                audioStatus.innerHTML =
-                    '<span style="color:red">⚠️ Audio player not available</span>';
-                return;
-            }
-            if (!checkAudioSource()) {
-                audioStatus.innerHTML =
-                    '<span style="color:red">⚠️ No audio source available</span>';
+                audioStatus.innerHTML = '<span style="color:red;">⚠️ No audio player available</span>';
                 return;
             }
 
-            // ─── ① read raw timings from data-attributes ────────────────────
+            audioStatus.innerHTML = '<span style="color:blue;">Enabling audio...</span>';
+            
+            const playPromise = player.play();
+            if (playPromise !== undefined) {
+                playPromise.then(() => {
+                    player.pause();
+                    player.currentTime = 0;
+                    vocabAudioUnlocked = true;
+                    audioStatus.innerHTML = '<span style="color:green;">✓ Audio enabled! Tap vocabulary cards to hear them</span>';
+                    unlockButton.style.display = 'none';
+                    console.log('Vocabulary audio unlocked for iOS');
+                }).catch(error => {
+                    console.error('Vocab audio unlock failed:', error);
+                    audioStatus.innerHTML = '<span style="color:red;">⚠️ Please try using the audio controls manually first</span>';
+                });
+            }
+        };
+
+        // Auto-hide unlock button on non-iOS devices
+        if (!isIOS) {
+            unlockButton.style.display = 'none';
+            audioStatus.innerHTML = '<span style="color:green;">Ready</span>';
+            vocabAudioUnlocked = true;
+        }
+
+        window.playVocab = function(card) {
+            if (!player) {
+                audioStatus.innerHTML = '<span style="color:red;">⚠️ Audio player not available</span>';
+                return;
+            }
+
             const rawStart = parseFloat(card.dataset.start);
-            const rawEnd   = parseFloat(card.dataset.end);
-            console.log("Raw Start:", rawStart, "Raw End:", rawEnd);
+            const rawEnd = parseFloat(card.dataset.end);
 
             if (isNaN(rawStart) || isNaN(rawEnd)) {
                 card.style.border = "2px solid orange";
-                audioStatus.innerHTML =
-                    '<span style="color:orange">⚠️ No timing data for this word</span>';
+                audioStatus.innerHTML = '<span style="color:orange;">⚠️ No timing data for this word</span>';
+                
+                // Add visual feedback
+                const existing = card.querySelector('.retry-instruction');
+                if (!existing) {
+                    const retryMsg = document.createElement('div');
+                    retryMsg.className = 'retry-instruction';
+                    retryMsg.innerHTML = 'No audio timing';
+                    card.appendChild(retryMsg);
+                    setTimeout(() => retryMsg.remove(), 2000);
+                }
+                
                 setTimeout(() => {
                     card.style.border = "";
-                    audioStatus.innerHTML = '<span style="color:green">Ready</span>';
+                    audioStatus.innerHTML = '<span style="color:green;">Ready</span>';
                 }, 2000);
                 return;
             }
 
-            // ─── ② add ± padding (seconds) and clamp inside audio duration ─
-            const EXTRA = 0.8;                                        // adjust here
+            // Check if audio needs to be unlocked for iOS
+            if (!vocabAudioUnlocked && isIOS) {
+                // Try to unlock first
+                const unlockPromise = player.play();
+                if (unlockPromise !== undefined) {
+                    unlockPromise.then(() => {
+                        player.pause();
+                        player.currentTime = 0;
+                        vocabAudioUnlocked = true;
+                        audioStatus.innerHTML = '<span style="color:green;">Audio unlocked!</span>';
+                        unlockButton.style.display = 'none';
+                        
+                        // Now play the actual vocab
+                        setTimeout(() => window.playVocab(card), 100);
+                    }).catch(error => {
+                        console.log('Vocab unlock failed:', error);
+                        audioStatus.innerHTML = '<span style="color:orange;">Tap "Enable Audio" button first</span>';
+                        
+                        // Visual feedback on card
+                        const existing = card.querySelector('.retry-instruction');
+                        if (!existing) {
+                            const retryMsg = document.createElement('div');
+                            retryMsg.className = 'retry-instruction';
+                            retryMsg.innerHTML = 'Enable audio first';
+                            card.appendChild(retryMsg);
+                            setTimeout(() => retryMsg.remove(), 3000);
+                        }
+                    });
+                }
+                return;
+            }
+
+            const EXTRA = 0.8;
             const startTime = rawStart + 0.3;
-            const endTime   = Math.min(
-                (player.duration || rawEnd + EXTRA + 1),            // if metadata not yet loaded
+            const endTime = Math.min(
+                (player.duration || rawEnd + EXTRA + 1),
                 rawEnd + EXTRA
             );
 
-            // ─── ③ highlight card / reset previous ─────────────────────────
+            // Highlight current card
             if (currentPlayingCard) {
                 currentPlayingCard.classList.remove("vocab-playing");
             }
             card.classList.add("vocab-playing");
             currentPlayingCard = card;
 
-            clearTimeout(stopTimeout);                            // cancel old snippet
+            clearTimeout(stopTimeout);
 
             try {
                 if (Math.abs(player.currentTime - startTime) > 0.1) {
@@ -1416,22 +1589,28 @@ def create_vocab_component(vocab_map, full_slowed_audio_path, filter_query="", s
 
                 const playPromise = player.play();
                 if (playPromise !== undefined) {
-                    playPromise
-                        .then(() => {
-                            audioStatus.innerHTML =
-                                '<span style="color:blue">▶️ Playing</span>';
-                        })
-                        .catch((error) => {
-                            console.error("Play failed:", error);
-                            audioStatus.innerHTML =
-                                '<span style="color:red">⚠️ Playback failed: ' +
-                                error.message +
-                                "</span>";
-                            card.classList.remove("vocab-playing");
-                        });
+                    playPromise.then(() => {
+                        audioStatus.innerHTML = '<span style="color:blue;">▶️ Playing</span>';
+                    }).catch((error) => {
+                        console.error("Vocab play failed:", error);
+                        audioStatus.innerHTML = '<span style="color:red;">⚠️ Playback failed</span>';
+                        card.classList.remove("vocab-playing");
+                        
+                        // Add retry instruction for iOS
+                        if (isIOS) {
+                            const existing = card.querySelector('.retry-instruction');
+                            if (!existing) {
+                                const retryMsg = document.createElement('div');
+                                retryMsg.className = 'retry-instruction';
+                                retryMsg.innerHTML = 'Try again or use controls';
+                                card.appendChild(retryMsg);
+                                setTimeout(() => retryMsg.remove(), 3000);
+                            }
+                        }
+                    });
                 }
 
-                // ─── ④ schedule pause after padded window finishes ──────────
+                // Schedule auto-stop
                 const duration = (endTime - startTime) * 1000;
                 stopTimeout = setTimeout(() => {
                     player.pause();
@@ -1439,20 +1618,19 @@ def create_vocab_component(vocab_map, full_slowed_audio_path, filter_query="", s
                         currentPlayingCard.classList.remove("vocab-playing");
                         currentPlayingCard = null;
                     }
-                    audioStatus.innerHTML = '<span style="color:green">Ready</span>';
-                }, duration + 100); // tiny buffer
+                    audioStatus.innerHTML = '<span style="color:green;">Ready</span>';
+                }, duration + 100);
 
             } catch (e) {
-                console.error("Error playing audio:", e);
-                audioStatus.innerHTML =
-                    '<span style="color:red">⚠️ Error: ' + e.message + "</span>";
+                console.error("Error playing vocab audio:", e);
+                audioStatus.innerHTML = '<span style="color:red;">⚠️ Error: ' + e.message + '</span>';
                 if (currentPlayingCard) {
                     currentPlayingCard.classList.remove("vocab-playing");
                 }
             }
         };
         
-        // Stop button function
+        // Stop function
         window.stopVocab = function() {
             if (player) {
                 player.pause();
@@ -1464,98 +1642,51 @@ def create_vocab_component(vocab_map, full_slowed_audio_path, filter_query="", s
                 currentPlayingCard = null;
             }
             
-            audioStatus.innerHTML = '<span style="color:green">Ready</span>';
+            audioStatus.innerHTML = '<span style="color:green;">Ready</span>';
         };
-        
-        // Set audio status when page loads
-        window.addEventListener('load', function() {
-            if (player) {
-                if (checkAudioSource()) {
-                    audioStatus.innerHTML = '<span style="color:green">Ready</span>';
+
+        // Audio event listeners
+        if (player) {
+            player.addEventListener('loadedmetadata', () => {
+                if (!isIOS || vocabAudioUnlocked) {
+                    audioStatus.innerHTML = '<span style="color:green;">Audio ready</span>';
                 }
+            });
+            
+            player.addEventListener('error', (e) => {
+                console.error('Vocab audio error:', e);
+                audioStatus.innerHTML = '<span style="color:red;">⚠️ Audio error</span>';
+            });
+
+            // For iOS, add touch unlock
+            if (isIOS) {
+                document.addEventListener('touchstart', function() {
+                    if (!vocabAudioUnlocked) {
+                        const unlockPromise = player.play();
+                        if (unlockPromise !== undefined) {
+                            unlockPromise.then(() => {
+                                player.pause();
+                                player.currentTime = 0;
+                                vocabAudioUnlocked = true;
+                                unlockButton.style.display = 'none';
+                                audioStatus.innerHTML = '<span style="color:green;">✓ Audio enabled</span>';
+                            }).catch(e => console.log('Background unlock failed:', e));
+                        }
+                    }
+                }, { once: true });
+            } else {
+                // Non-iOS devices
+                vocabAudioUnlocked = true;
+                unlockButton.style.display = 'none';
+                audioStatus.innerHTML = '<span style="color:green;">Ready</span>';
             }
-        });
+        }
+
     })();
     </script>
     """
     
-    # Add diagnostic tools for troubleshooting
-    html_content += """
-    <div style="margin-top: 20px; padding: 10px; border: 1px solid #ddd; background: #f9f9f9; border-radius: 4px;">
-        <label style="display: block; margin-bottom: 10px;">
-            <input type="checkbox" id="toggle-debug" onclick="toggleDebug()"> 
-            Show debugging information
-        </label>
-        <div id="debug-panel" style="display: none; margin-top: 10px;">
-            <h3>Audio Element Debug:</h3>
-            <pre id="audio-debug"></pre>
-            <h3>Timing Data Debug:</h3>
-            <pre id="timing-debug"></pre>
-            <button onclick="testAudio()" style="padding: 5px 10px; background: #4285f4; color: white; border: none; border-radius: 4px; cursor: pointer;">Test Audio</button>
-        </div>
-    </div>
-
-    <script>
-    function toggleDebug() {
-        const debugPanel = document.getElementById('debug-panel');
-        debugPanel.style.display = debugPanel.style.display === 'none' ? 'block' : 'none';
-        
-        if (debugPanel.style.display === 'block') {
-            const audioEl = document.getElementById('vocab-player');
-            document.getElementById('audio-debug').textContent = 
-                'Audio element exists: ' + (audioEl ? 'Yes' : 'No') + '\\n' +
-                'Audio source: ' + (audioEl && audioEl.querySelector('source') ? 
-                                   audioEl.querySelector('source').src.substring(0, 50) + '...' : 'None') + '\\n' +
-                'Ready state: ' + (audioEl ? audioEl.readyState : 'N/A') + '\\n' +
-                'Network state: ' + (audioEl ? audioEl.networkState : 'N/A') + '\\n' +
-                'Paused: ' + (audioEl ? audioEl.paused : 'N/A') + '\\n' +
-                'Duration: ' + (audioEl ? audioEl.duration : 'N/A') + '\\n' +
-                'Error: ' + (audioEl && audioEl.error ? audioEl.error.message : 'None');
-                
-            // Show timing data for cards
-            let timingInfo = '';
-            const cards = document.querySelectorAll('.vocab-card');
-            for (let i = 0; i < Math.min(5, cards.length); i++) {
-                const card = cards[i];
-                const jp = card.querySelector('.vocab-japanese').textContent;
-                timingInfo += `Card ${i+1}: "${jp.substring(0, 10)}..." ` + 
-                              `Start: ${card.dataset.start}, End: ${card.dataset.end}\\n`;
-            }
-            document.getElementById('timing-debug').textContent = timingInfo;
-        }
-    }
-
-    function testAudio() {
-        const audioEl = document.getElementById('vocab-player');
-        if (!audioEl) {
-            alert('Audio element not found!');
-            return;
-        }
-        
-        try {
-            audioEl.currentTime = 0;
-            const playPromise = audioEl.play();
-            if (playPromise !== undefined) {
-                playPromise.then(_ => {
-                    setTimeout(() => {
-                        audioEl.pause();
-                        alert('Audio test successful!');
-                    }, 2000);
-                }).catch(e => {
-                    alert('Audio play error: ' + e);
-                });
-            }
-        } catch (e) {
-            alert('Audio test error: ' + e);
-        }
-    }
-    </script>
-    """
-    
     return html_content
-
-
-
 
 def populate_vocab_tab(tab_word, vocab_map, video_id, video_dir_name):
     """
@@ -1568,9 +1699,7 @@ def populate_vocab_tab(tab_word, vocab_map, video_id, video_dir_name):
         video_dir_name: Directory name for the current video data
     """
     
-    with tab_word:
-        #st.subheader("📚 단어 (Kanji Vocabulary)")
-        
+    with tab_word:        
         if not vocab_map:
             st.info("이 영상에 한자가 포함된 단어가 없습니다.")
         else:
@@ -1727,14 +1856,12 @@ def run_full_pipeline(url: str, force: bool):
     """
     # Setup status placeholders
     status_placeholder = st.empty()
-    #progress_bar_placeholder = st.empty()
     
     # Create tabs immediately
     tabs = st.tabs(["스크립트", "문장", "단어", "한자", "텍스트", "JSON"])
     tab1, tab2, tab_word, tab3, tab4, tab5 = tabs
     
     status_placeholder.info("1단계: 다운로드 중...")
-    #progress_bar_placeholder.progress(0.05)
     
     conn = get_db_connection()
     if conn is None:
@@ -1927,7 +2054,6 @@ def run_full_pipeline(url: str, force: bool):
         cursor.execute("UPDATE Videos SET full_slowed_audio_path = ? WHERE id = ?", (slowed_full_audio_name, video_id))
         
         # Update progress
-        #progress_bar_placeholder.progress(0.2)
         status_placeholder.info("음성 변환 완료. 스크립트 변환 중...")
         
         # Transcribe audio
@@ -1937,7 +2063,6 @@ def run_full_pipeline(url: str, force: bool):
             return None
         
         # Process transcript data
-        #progress_bar_placeholder.progress(0.3)
         status_placeholder.info("스크립트 처리 중...")
         
         full_transcript, segments_list = prepare_japanese_segments(transcript_data)
@@ -1977,7 +2102,6 @@ def run_full_pipeline(url: str, force: bool):
         
         # STAGE 2: Analyze segments with GPT
         status_placeholder.info("구문 분석 시작...")
-        #progress_bar_placeholder.progress(0.4)
         
         # Create a container for segments in Tab 2
         with tab2:
@@ -1991,9 +2115,7 @@ def run_full_pipeline(url: str, force: bool):
         total_segments = len(segment_db_data)
         
         for i, segment in enumerate(segment_db_data):
-            segment_progress = 0.4 + (0.5 * ((i+1) / total_segments))  # Fixed to reach 0.9 at the end
             status_placeholder.info(f"세그먼트 {i + 1}/{total_segments} GPT 분석 중...")
-            #progress_bar_placeholder.progress(segment_progress)
             
             # Analyze segment
             db_segment_id = segment['db_id']
@@ -2067,7 +2189,6 @@ def run_full_pipeline(url: str, force: bool):
         
         # STAGE 3: Extract kanji information
         status_placeholder.info("한자 정보 추출 및 저장 중...")
-        #progress_bar_placeholder.progress(0.95)
         
         extract_and_store_kanji_for_video(conn, video_id)
         
@@ -2107,7 +2228,6 @@ def run_full_pipeline(url: str, force: bool):
         
         # Final status
         status_placeholder.success("모든 처리 완료!")
-        #progress_bar_placeholder.progress(1.0)
         
         # Save results to session state
         st.session_state["last_video_id"] = video_id
@@ -2134,6 +2254,17 @@ def run_full_pipeline(url: str, force: bool):
 
 # --- Main Streamlit App UI ---
 st.title("일본어 🇯🇵")
+
+# Add iOS help section right after title
+if st.sidebar.button("📱 iOS Audio Help"):
+    st.info("""
+    **iPad/iPhone Audio Setup:**
+    1. Tap any "🔊 Enable Audio" button first
+    2. Then tap vocabulary cards or transcript words
+    3. If audio still doesn't work, try playing the main audio controls manually first
+    4. Some browsers may require you to interact with the page before audio works
+    5. Double-tap words to pause audio
+    """)
 
 # ───────── sidebar navigation ─────────
 side = st.sidebar
@@ -2188,6 +2319,5 @@ if "last_video_id" in st.session_state:
     if conn:
         video_info = conn.execute("SELECT video_title, video_data_directory FROM Videos WHERE id = ?", (st.session_state["last_video_id"],)).fetchone()
         if video_info:
-            #st.success(f"최근 분석: {video_info['video_title']}")
             pass
         conn.close()
