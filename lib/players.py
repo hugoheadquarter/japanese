@@ -103,8 +103,7 @@ def create_synchronized_player(
                     span.id='w-{pid}-'+idx;idx++;
                     span.style.cursor='pointer';
                     span.style.transition='color 0.2s,font-weight 0.2s';
-                    span.onclick=()=>{{audio.currentTime=w.start;audio.play().catch(()=>{{}});}};
-                    span.ondblclick=(e)=>{{e.preventDefault();audio.pause();}};
+                    span.onclick=()=>{{if(!audio.paused){{audio.pause();}}else{{audio.currentTime=w.start;audio.play().catch(()=>{{}});}}}};
                     div.appendChild(span);
                 }});
                 display.appendChild(div);
@@ -171,7 +170,7 @@ def create_phrase_player_html(
     <script>
     (function(){{
         "use strict";
-        if(!window.__pam){{window.__pam={{cur:null,clearFn:null,stopCur(){{
+        if(!window.parent.__pam){{window.parent.__pam={{cur:null,clearFn:null,stopCur(){{
             if(this.cur)try{{this.cur.pause();}}catch(_){{}}
             if(this.clearFn)this.clearFn();this.cur=null;this.clearFn=null;
         }}}};}}
@@ -211,11 +210,13 @@ def create_phrase_player_html(
                 span.style.marginRight='2px';
                 span.onclick=()=>{{
                     if(!aud)return;
-                    window.__pam.stopCur();
-                    window.__pam.cur=aud;window.__pam.clearFn=clearHL;
-                    aud.currentTime=w.start;aud.play().catch(()=>{{}});
+                    if(!aud.paused&&window.parent.__pam.cur===aud){{aud.pause();}}
+                    else{{
+                        window.parent.__pam.stopCur();
+                        window.parent.__pam.cur=aud;window.parent.__pam.clearFn=clearHL;
+                        aud.currentTime=w.start;aud.play().catch(()=>{{}});
+                    }}
                 }};
-                span.ondblclick=(e)=>{{e.preventDefault();if(aud)aud.pause();}};
                 div.appendChild(span);
             }});
             txt.appendChild(div);
