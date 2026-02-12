@@ -73,6 +73,9 @@ def _cached_vocab(video_id):
 st.markdown("""
 <style>
 .phrase-player audio{display:none!important;}
+div[data-testid="stHtml"]{margin-bottom:0!important;padding-bottom:0!important;}
+.stHtml{margin-bottom:0!important;padding-bottom:0!important;}
+.element-container:has(iframe){margin-bottom:0!important;padding-bottom:0!important;}
 rt{font-size:0.7em;opacity:0.9;user-select:none;}
 ul.kanji-list{padding-left:0!important;list-style-type:none!important;}
 .kanji-card-container{padding-top:10px;}
@@ -193,9 +196,11 @@ with tab1:
         st.info("Audio or transcript data missing.")
 
 
-# Tab 2: Breakdown (no expanders)
+# Tab 2: Breakdown (all segments in one iframe)
 with tab2:
     segments = _cached_segments(vid_id)
+    all_html_parts = []
+    total_height = 30
     for seg in segments:
         seg_id = seg["id"]
 
@@ -214,8 +219,12 @@ with tab2:
             sync_map[idx] = sw
 
         html = generate_breakdown_html(phrases_data, audio_map, sync_map, video_dir, seg_id)
-        px = estimate_segment_height(phrases_data)
-        st.components.v1.html(html, height=px, scrolling=False)
+        all_html_parts.append(html)
+        total_height += estimate_segment_height(phrases_data)
+
+    if all_html_parts:
+        combined = "".join(all_html_parts)
+        st.components.v1.html(combined, height=total_height, scrolling=False)
 
 
 # Tab 3 (vocab): 단어

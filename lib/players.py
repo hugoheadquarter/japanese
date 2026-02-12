@@ -330,17 +330,37 @@ def generate_breakdown_html(
         if i < len(phrases_data) - 1:
             parts.append("<hr style='margin-top:15px;margin-bottom:15px;border:0;height:1px;background-color:#e0e0e0;'>")
 
+    # Auto-resize via Streamlit's postMessage API
+    parts.append("""
+    <script>
+    (function(){
+        function sendHeight(){
+            var h=document.documentElement.scrollHeight;
+            if(h>10){
+                window.parent.postMessage({type:"streamlit:setFrameHeight",height:h},"*");
+            }
+        }
+        sendHeight();
+        setTimeout(sendHeight,100);
+        setTimeout(sendHeight,300);
+    })();
+    </script>
+    """)
+
     return "".join(parts)
 
 
 def estimate_segment_height(phrases: list[dict]) -> int:
-    """Generous height estimate so content never gets clipped."""
-    total = 60
+    """Height estimate per segment - slightly generous to avoid clipping."""
+    total = 30
     for p in phrases:
-        base = 160  # phrase player + meaning
+        # phrase text ~60px + meaning ~40px + table header ~42px + margin/padding ~30px
+        total += 60 + 40 + 42 + 30
         word_rows = max(1, len(p.get("words", [])))
-        total += base + word_rows * 38 + 30  # 30 for hr
-    return max(300, total)
+        total += word_rows * 40
+        # hr between phrases
+        total += 20
+    return max(200, total)
 
 
 # ---------------------------------------------------------------------------

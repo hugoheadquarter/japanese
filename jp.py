@@ -7,9 +7,11 @@ Thin UI layer. All logic in lib/ modules.
 import streamlit as st
 import json
 import os
+import time
 import tempfile
 import shutil
 import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -144,6 +146,9 @@ ul.kanji-list li{font-size:14px!important;line-height:1.6!important;margin-botto
 div.meaning-paragraph p{font-size:20px!important;line-height:1.6!important;margin-top:5px!important;}
 hr{margin-top:20px!important;margin-bottom:20px!important;border:0!important;height:1px!important;background-color:#e0e0e0!important;}
 .phrase-player{margin-bottom:15px!important;border-radius:4px!important;overflow:hidden!important;}
+div[data-testid="stHtml"]{margin-bottom:0!important;padding-bottom:0!important;}
+.stHtml{margin-bottom:0!important;padding-bottom:0!important;}
+.element-container:has(iframe){margin-bottom:0!important;padding-bottom:0!important;}
 .kanji-card-container{padding-top:10px;}
 .kanji-card{border:1px solid #e0e0e0;padding:20px;margin-bottom:20px;border-radius:10px;background:#fff;
     display:flex;align-items:center;transition:box-shadow 0.2s,transform 0.2s;height:180px;box-sizing:border-box;}
@@ -202,12 +207,15 @@ def populate_transcript_tab(tab, video_dir: str, audio_fn: str, sync_json: str):
 
 
 def populate_breakdown_tab(tab, video_id: int, video_dir: str):
-    """Fill the breakdown tab with segments rendered directly (no expanders)."""
+    """Fill the breakdown tab - all segments in one iframe."""
     with tab:
         segments = cached_segments(video_id)
         if not segments:
             st.info("분석 데이터가 없습니다.")
             return
+
+        all_html_parts = []
+        total_height = 30
 
         for seg in segments:
             seg_id = seg["id"]
@@ -234,8 +242,12 @@ def populate_breakdown_tab(tab, video_id: int, video_dir: str):
             html = generate_breakdown_html(
                 phrases_data, audio_map, sync_map, video_dir, seg_id
             )
-            px = estimate_segment_height(phrases_data)
-            st.components.v1.html(html, height=px, scrolling=False)
+            all_html_parts.append(html)
+            total_height += estimate_segment_height(phrases_data)
+
+        if all_html_parts:
+            combined = "".join(all_html_parts)
+            st.components.v1.html(combined, height=total_height, scrolling=False)
 
 
 def populate_vocab_tab(tab, video_id: int, video_dir: str, audio_fn: str | None):
@@ -491,32 +503,79 @@ def run_full_pipeline(url: str, force: bool):
         with open(seg_debug_path, "w", encoding="utf-8") as f:
             json.dump(seg_debug, f, ensure_ascii=False, indent=2)
 
-        # --- STAGE 2: Claude analysis ---
+        # --- STAGE 2: Claude analysis (concurrent) ---
         status.info("3단계: 구문 분석 시작...")
-
-        with tab_breakdown:
-            seg_container = st.container()
 
         vocab_map = {}
         total = len(segments_list)
         all_claude_analyses = []  # Collect raw responses for debug file
         analysis_debug_path = video_dir_abs / "claude_analyses.json"
 
-        for i, seg in enumerate(segments_list):
-            status.info(f"세그먼트 {i+1}/{total} 분석 중...")
-            db_seg_id = seg["db_id"]
-
-            # Build context from previous 1-2 segments
-            prev_ctx = ""
+        # Pre-compute context for each segment (previous 1-2 segments)
+        contexts = []
+        for i in range(total):
             if i >= 2:
-                prev_ctx = segments_list[i-2]["text"] + " " + segments_list[i-1]["text"]
+                contexts.append(segments_list[i-2]["text"] + " " + segments_list[i-1]["text"])
             elif i >= 1:
-                prev_ctx = segments_list[i-1]["text"]
+                contexts.append(segments_list[i-1]["text"])
+            else:
+                contexts.append("")
 
-            analysis = analyze_japanese_segment(
-                seg["text"], seg["start"], seg["end"], seg["words"],
-                previous_context=prev_ctx,
-            )
+        def analyze_with_retry(seg_index):
+            """Analyze a segment with retry logic (rate-limit aware)."""
+            seg = segments_list[seg_index]
+            max_retries = 3
+            last_error = None
+            for attempt in range(max_retries):
+                try:
+                    result = analyze_japanese_segment(
+                        seg["text"], seg["start"], seg["end"], seg["words"],
+                        previous_context=contexts[seg_index],
+                    )
+                    if result and result.get("phrases"):
+                        return (seg_index, result, None)
+                    # Empty result — retry
+                    last_error = "Empty response from Claude"
+                except Exception as e:
+                    last_error = str(e)
+                    is_rate_limit = "429" in str(e) or "rate" in str(e).lower() or "overloaded" in str(e).lower()
+                    if attempt < max_retries - 1:
+                        if is_rate_limit:
+                            wait = (5 * (attempt + 1)) + (2 * seg_index % 10)  # 5-15s + stagger
+                        else:
+                            wait = (2 ** attempt) + (0.5 * attempt)  # 1s, 2.5s
+                        time.sleep(wait)
+            # All retries exhausted
+            return (seg_index, {"phrases": []}, last_error)
+
+        # Fire all segment analyses concurrently
+        analysis_results = [None] * total
+        completed_count = 0
+
+        with ThreadPoolExecutor(max_workers=min(50, total)) as executor:
+            futures = {
+                executor.submit(analyze_with_retry, i): i
+                for i in range(total)
+            }
+
+            for future in as_completed(futures):
+                seg_idx, analysis, error = future.result()
+                analysis_results[seg_idx] = analysis
+                completed_count += 1
+                if error:
+                    status.warning(f"세그먼트 {seg_idx+1}/{total}: 재시도 실패 - {error}")
+                else:
+                    status.info(f"구문 분석 {completed_count}/{total} 완료...")
+
+        # Process results in order (audio clips, DB, collect HTML)
+        status.info("3단계: 오디오 클립 생성 및 저장 중...")
+
+        all_html_parts = []
+        total_height = 30
+
+        for i, seg in enumerate(segments_list):
+            db_seg_id = seg["db_id"]
+            analysis = analysis_results[i]
 
             # Save raw response for debugging
             all_claude_analyses.append({
@@ -524,11 +583,11 @@ def run_full_pipeline(url: str, force: bool):
                 "segment_text": seg["text"],
                 "claude_response": analysis,
             })
-            # Write incrementally so partial results survive if stopped early
-            with open(analysis_debug_path, "w", encoding="utf-8") as f:
-                json.dump(all_claude_analyses, f, ensure_ascii=False, indent=2)
 
             phrases = analysis.get("phrases", [])
+            if not phrases:
+                continue
+
             timings = [
                 (p.get("original_start_time", 0), p.get("original_end_time", 0))
                 for p in phrases
@@ -565,13 +624,22 @@ def run_full_pipeline(url: str, force: bool):
             batch_insert_phrase_analyses(conn, batch_rows)
             conn.commit()
 
-            # Render segment HTML immediately
-            with seg_container:
-                html = generate_breakdown_html(
-                    phrases, audio_map, sync_map, video_dir, db_seg_id
-                )
-                px = estimate_segment_height(phrases)
-                st.components.v1.html(html, height=px, scrolling=False)
+            # Collect HTML for combined render
+            html = generate_breakdown_html(
+                phrases, audio_map, sync_map, video_dir, db_seg_id
+            )
+            all_html_parts.append(html)
+            total_height += estimate_segment_height(phrases)
+
+        # Render all segments as one single iframe (no gaps)
+        if all_html_parts:
+            with tab_breakdown:
+                combined = "".join(all_html_parts)
+                st.components.v1.html(combined, height=total_height, scrolling=False)
+
+        # Save all analyses debug file
+        with open(analysis_debug_path, "w", encoding="utf-8") as f:
+            json.dump(all_claude_analyses, f, ensure_ascii=False, indent=2)
 
         # --- STAGE 3: Kanji & Vocab ---
         status.info("4단계: 한자 추출 중...")
