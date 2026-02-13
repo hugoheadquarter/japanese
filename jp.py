@@ -14,6 +14,8 @@ import tempfile
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from lib.ensure_deno import ensure_deno
+ensure_deno()
 
 # Page config (must be first st call)
 st.set_page_config(layout="wide", page_title="日本語")
