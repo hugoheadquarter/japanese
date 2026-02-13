@@ -624,7 +624,7 @@ DEEPGRAM_KEY = st.secrets.get("DEEPGRAM_API_KEY")
 ANTHROPIC_KEY = st.secrets.get("ANTHROPIC_API_KEY")
 
 side = st.sidebar
-choice = side.radio("", ("Home", "History", "Sources"), index=0)
+choice = side.radio("Navigation", ("Home", "History", "Sources"), index=0, label_visibility="collapsed")
 
 if not ANTHROPIC_KEY:
     side.error("Anthropic API key missing.")
