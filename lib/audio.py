@@ -35,29 +35,31 @@ def download_audio(url: str, output_dir: Path) -> tuple[str | None, str | None]:
 
         async def _download():
             return await pybalt_download(
-                url,
+                url=url,
                 downloadMode="audio",
                 audioFormat="mp3",
                 audioBitrate="192",
-                filepath=str(output_dir),
+                folder_path=str(output_dir),
             )
 
         loop = asyncio.new_event_loop()
         file_path = loop.run_until_complete(_download())
         loop.close()
 
-        if file_path and os.path.exists(file_path):
-            # Rename to match expected title-based naming
+        print(f"[pybalt] Result: {file_path}")
+        if file_path and os.path.exists(str(file_path)):
             safe_title = "".join(c for c in title if c.isalnum() or c in " -_")[:80]
             target = output_dir / f"{safe_title}.mp3"
             if str(file_path) != str(target):
-                os.rename(file_path, str(target))
+                os.rename(str(file_path), str(target))
             print(f"[pybalt] Downloaded: {target.name}")
             return str(target), title
         else:
             print(f"[pybalt] No file returned")
     except Exception as e:
+        import traceback
         print(f"[pybalt] Error: {e}")
+        traceback.print_exc()
 
     # --- Fallback to yt-dlp ---
     ydl_opts = {
