@@ -31,10 +31,11 @@ def download_audio(url: str, output_dir: Path) -> tuple[str | None, str | None]:
     # --- Try pybalt (cobalt instances) first ---
     try:
         import asyncio
-        from pybalt import download as pybalt_download
+        from pybalt.core.wrapper import InstanceManager
 
         async def _download():
-            return await pybalt_download(
+            mgr = InstanceManager(debug=True)
+            return await mgr.download(
                 url=url,
                 downloadMode="audio",
                 audioFormat="mp3",
