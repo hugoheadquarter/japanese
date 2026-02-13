@@ -5,8 +5,9 @@ All operations work on local temp files.  The caller (jp.py) is responsible
 for uploading final outputs to Supabase Storage.
 
 Download strategy (in order):
-  1. Piped API  – works on cloud (proxied streams bypass YouTube IP blocks)
-  2. yt-dlp     – works locally (residential IP not blocked)
+  1. Piped API     – proxied streams bypass YouTube IP blocks
+  2. Invidious API – proxied streams via ?local=true
+  3. yt-dlp        – works locally (residential IP not blocked)
 """
 
 from __future__ import annotations
@@ -19,18 +20,53 @@ from pathlib import Path
 from pydub import AudioSegment
 
 # ---------------------------------------------------------------------------
-# Piped API configuration
+# Instance lists – order matters, try most reliable first
 # ---------------------------------------------------------------------------
 
-# Multiple instances for fallback.  Order matters — try fastest/most reliable first.
 PIPED_INSTANCES = [
     "https://pipedapi.kavin.rocks",
-    "https://pipedapi.adminforge.de",
-    "https://api.piped.yt",
     "https://pipedapi.leptons.xyz",
     "https://pipedapi-libre.kavin.rocks",
+    "https://pipedapi.adminforge.de",
+    "https://api.piped.yt",
+    "https://pipedapi.nosebs.ru",
+    "https://pipedapi.r4fo.com",
     "https://piped-api.privacy.com.de",
     "https://pipedapi.drgns.space",
+    "https://pipedapi.tokhmi.xyz",
+    "https://pipedapi.moomoo.me",
+    "https://pipedapi.syncpundit.io",
+    "https://piped-api.lunar.icu",
+    "https://ytapi.dc09.ru",
+    "https://pa.il.ax",
+    "https://pa.mint.lgbt",
+    "https://pipedapi.colinslegacy.com",
+]
+
+INVIDIOUS_INSTANCES = [
+    "https://yewtu.be",
+    "https://vid.puffyan.us",
+    "https://invidious.nerdvpn.de",
+    "https://iv.ggtyler.dev",
+    "https://invidious.privacydev.net",
+    "https://invidious.lunar.icu",
+    "https://invidious.protokolla.fi",
+    "https://inv.tux.pizza",
+    "https://invidious.private.coffee",
+    "https://invidious.flokinet.to",
+    "https://invidious.projectsegfau.lt",
+    "https://invidious.slipfox.xyz",
+    "https://vid.priv.au",
+    "https://iv.melmac.space",
+    "https://inv.zzls.xyz",
+    "https://invidious.no-logs.com",
+    "https://invidious.io.lol",
+    "https://yt.artemislena.eu",
+    "https://invidious.asir.dev",
+    "https://iv.nboeck.de",
+    "https://yt.drgnz.club",
+    "https://inv.nadeko.net",
+    "https://invidious.jing.rocks",
 ]
 
 
@@ -49,17 +85,9 @@ def _extract_video_id(url: str) -> str | None:
     return None
 
 
-def _get_title_via_ytdlp(url: str) -> str:
-    """Use yt-dlp to extract just the title (metadata only, no download)."""
-    try:
-        import yt_dlp
-        with yt_dlp.YoutubeDL({"quiet": True, "skip_download": True, "noplaylist": True}) as ydl:
-            info = ydl.extract_info(url, download=False)
-            return info.get("title", "video")
-    except Exception as e:
-        print(f"[yt-dlp] Title extraction error: {e}")
-        return "video"
-
+# ---------------------------------------------------------------------------
+# Piped API downloader
+# ---------------------------------------------------------------------------
 
 def _download_via_piped(url: str, output_dir: Path) -> tuple[str | None, str | None]:
     """
@@ -77,14 +105,15 @@ def _download_via_piped(url: str, output_dir: Path) -> tuple[str | None, str | N
         print("[piped] Could not extract video ID")
         return None, None
 
-    # Try each Piped instance until one works
     stream_data = None
     for instance in PIPED_INSTANCES:
-        api_url = f"{instance}/streams/{video_id}"
+        # CRITICAL: ensure proper URL construction with /
+        base = instance.rstrip("/")
+        api_url = f"{base}/streams/{video_id}"
         try:
             print(f"[piped] Trying {instance}...")
             resp = requests.get(api_url, timeout=15, headers={
-                "User-Agent": "Mozilla/5.0 (compatible; AudioDownloader/1.0)"
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
             })
             if resp.status_code == 200:
                 data = resp.json()
@@ -101,19 +130,17 @@ def _download_via_piped(url: str, output_dir: Path) -> tuple[str | None, str | N
             continue
 
     if not stream_data or not stream_data.get("audioStreams"):
-        print("[piped] All instances failed")
+        print("[piped] All Piped instances failed")
         return None, None
 
     title = stream_data.get("title", "video")
 
-    # Pick best audio stream (highest bitrate, prefer mp4a/opus)
+    # Pick best audio stream (highest bitrate)
     audio_streams = stream_data["audioStreams"]
-    # Filter out video-only streams
     audio_only = [s for s in audio_streams if not s.get("videoOnly", False)]
     if not audio_only:
         audio_only = audio_streams
 
-    # Sort by bitrate descending
     audio_only.sort(key=lambda s: s.get("bitrate", 0), reverse=True)
     best = audio_only[0]
 
@@ -126,6 +153,116 @@ def _download_via_piped(url: str, output_dir: Path) -> tuple[str | None, str | N
         print("[piped] No URL in selected stream")
         return None, None
 
+    return _download_and_convert(stream_url, title, mime_type, output_dir, "piped")
+
+
+# ---------------------------------------------------------------------------
+# Invidious API downloader
+# ---------------------------------------------------------------------------
+
+def _download_via_invidious(url: str, output_dir: Path) -> tuple[str | None, str | None]:
+    """
+    Download audio via Invidious API with ?local=true for proxied streams.
+
+    1. Call /api/v1/videos/{videoId}?local=true on an Invidious instance
+    2. The response includes adaptiveFormats with proxied URLs
+    3. Pick best audio format (itag 140=m4a 128k, 251=webm/opus 160k)
+    4. Download from the proxied URL
+    """
+    import requests
+
+    video_id = _extract_video_id(url)
+    if not video_id:
+        print("[invidious] Could not extract video ID")
+        return None, None
+
+    stream_url = None
+    title = "video"
+    mime_type = "audio/mp4"
+
+    for instance in INVIDIOUS_INSTANCES:
+        base = instance.rstrip("/")
+        api_url = f"{base}/api/v1/videos/{video_id}?local=true"
+        try:
+            print(f"[invidious] Trying {instance}...")
+            resp = requests.get(api_url, timeout=15, headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            })
+            if resp.status_code == 200:
+                data = resp.json()
+                title = data.get("title", "video")
+
+                # Get audio formats from adaptiveFormats
+                adaptive = data.get("adaptiveFormats", [])
+                audio_formats = [
+                    f for f in adaptive
+                    if f.get("type", "").startswith("audio/")
+                ]
+
+                if not audio_formats:
+                    print(f"[invidious] {instance} returned no audio formats")
+                    continue
+
+                # Prefer itag 251 (opus ~160k) > 140 (m4a 128k) > others
+                preferred_itags = [251, 140, 250, 249]
+                best_format = None
+                for itag in preferred_itags:
+                    for f in audio_formats:
+                        if f.get("itag") == str(itag) or f.get("itag") == itag:
+                            best_format = f
+                            break
+                    if best_format:
+                        break
+
+                if not best_format:
+                    # Fall back to highest bitrate
+                    audio_formats.sort(
+                        key=lambda f: int(f.get("bitrate", "0") if isinstance(f.get("bitrate"), str) else f.get("bitrate", 0)),
+                        reverse=True,
+                    )
+                    best_format = audio_formats[0]
+
+                fmt_url = best_format.get("url")
+                if not fmt_url:
+                    print(f"[invidious] {instance} format has no URL")
+                    continue
+
+                # If URL is relative, prepend instance base
+                if fmt_url.startswith("/"):
+                    fmt_url = f"{base}{fmt_url}"
+
+                stream_url = fmt_url
+                mime_type = best_format.get("type", "audio/mp4").split(";")[0]
+                quality = best_format.get("bitrate", "?")
+                print(f"[invidious] Selected: itag={best_format.get('itag')} | {mime_type} | bitrate={quality}")
+                break
+            else:
+                print(f"[invidious] {instance} returned HTTP {resp.status_code}")
+        except Exception as e:
+            print(f"[invidious] {instance} error: {e}")
+            continue
+
+    if not stream_url:
+        print("[invidious] All Invidious instances failed")
+        return None, None
+
+    return _download_and_convert(stream_url, title, mime_type, output_dir, "invidious")
+
+
+# ---------------------------------------------------------------------------
+# Shared download + convert logic
+# ---------------------------------------------------------------------------
+
+def _download_and_convert(
+    stream_url: str,
+    title: str,
+    mime_type: str,
+    output_dir: Path,
+    source: str,
+) -> tuple[str | None, str | None]:
+    """Download a stream URL and convert to MP3."""
+    import requests
+
     # Determine file extension from mime type
     ext = "m4a"
     if "webm" in mime_type or "opus" in mime_type:
@@ -133,15 +270,14 @@ def _download_via_piped(url: str, output_dir: Path) -> tuple[str | None, str | N
     elif "ogg" in mime_type:
         ext = "ogg"
 
-    # Download the audio stream
     safe_title = re.sub(r'[^\w\s\-]', '', title)[:80].strip() or "audio"
     raw_path = output_dir / f"{safe_title}.{ext}"
     mp3_path = output_dir / f"{safe_title}.mp3"
 
     try:
-        print(f"[piped] Downloading audio stream...")
-        with requests.get(stream_url, stream=True, timeout=120, headers={
-            "User-Agent": "Mozilla/5.0 (compatible; AudioDownloader/1.0)"
+        print(f"[{source}] Downloading audio stream...")
+        with requests.get(stream_url, stream=True, timeout=180, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
         }) as r:
             r.raise_for_status()
             total = 0
@@ -149,19 +285,33 @@ def _download_via_piped(url: str, output_dir: Path) -> tuple[str | None, str | N
                 for chunk in r.iter_content(chunk_size=65536):
                     f.write(chunk)
                     total += len(chunk)
-        print(f"[piped] Downloaded {total / 1024 / 1024:.1f} MB")
+        print(f"[{source}] Downloaded {total / 1024 / 1024:.1f} MB")
     except Exception as e:
-        print(f"[piped] Download error: {e}")
+        print(f"[{source}] Download error: {e}")
+        # Clean up partial file
+        try:
+            raw_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return None, None
+
+    # Check we actually got audio data (not an error page)
+    if raw_path.stat().st_size < 10000:
+        print(f"[{source}] Downloaded file too small ({raw_path.stat().st_size} bytes), likely error page")
+        try:
+            raw_path.unlink(missing_ok=True)
+        except Exception:
+            pass
         return None, None
 
     # Convert to MP3 using ffmpeg
     try:
-        print(f"[piped] Converting to MP3...")
+        print(f"[{source}] Converting to MP3...")
         result = subprocess.run(
             [
                 "ffmpeg", "-y",
                 "-i", str(raw_path),
-                "-vn",                    # no video
+                "-vn",
                 "-acodec", "libmp3lame",
                 "-ab", "192k",
                 "-ar", "44100",
@@ -172,22 +322,20 @@ def _download_via_piped(url: str, output_dir: Path) -> tuple[str | None, str | N
             timeout=120,
         )
         if result.returncode != 0:
-            print(f"[piped] ffmpeg error: {result.stderr[:500]}")
-            # If ffmpeg fails, try to use pydub as fallback
+            print(f"[{source}] ffmpeg error: {result.stderr[:500]}")
             try:
                 audio = AudioSegment.from_file(str(raw_path))
                 audio.export(str(mp3_path), format="mp3", bitrate="192k")
-                print("[piped] Converted via pydub fallback")
+                print(f"[{source}] Converted via pydub fallback")
             except Exception as e2:
-                print(f"[piped] pydub fallback also failed: {e2}")
+                print(f"[{source}] pydub fallback also failed: {e2}")
                 return None, None
         else:
-            print("[piped] MP3 conversion complete")
+            print(f"[{source}] MP3 conversion complete")
     except Exception as e:
-        print(f"[piped] Conversion error: {e}")
+        print(f"[{source}] Conversion error: {e}")
         return None, None
     finally:
-        # Clean up raw file
         try:
             raw_path.unlink(missing_ok=True)
         except Exception:
@@ -196,9 +344,13 @@ def _download_via_piped(url: str, output_dir: Path) -> tuple[str | None, str | N
     if mp3_path.exists() and mp3_path.stat().st_size > 1000:
         return str(mp3_path), title
     else:
-        print("[piped] Output file missing or too small")
+        print(f"[{source}] Output file missing or too small")
         return None, None
 
+
+# ---------------------------------------------------------------------------
+# yt-dlp fallback
+# ---------------------------------------------------------------------------
 
 def _download_via_ytdlp(url: str, output_dir: Path) -> tuple[str | None, str | None]:
     """Download audio via yt-dlp (works on residential IPs)."""
@@ -232,12 +384,17 @@ def _download_via_ytdlp(url: str, output_dir: Path) -> tuple[str | None, str | N
         return None, None
 
 
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
+
 def download_audio(url: str, output_dir: Path) -> tuple[str | None, str | None]:
     """Download audio from YouTube URL.  Returns (filepath, title) or (None, None).
 
     Strategy:
-      1. Try Piped API (works on cloud — proxied streams bypass YouTube IP blocks)
-      2. Fall back to yt-dlp (works locally with residential IP)
+      1. Try Piped API (proxied streams bypass YouTube IP blocks)
+      2. Try Invidious API (proxied streams via ?local=true)
+      3. Fall back to yt-dlp (works locally with residential IP)
     """
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -248,8 +405,15 @@ def download_audio(url: str, output_dir: Path) -> tuple[str | None, str | None]:
         print(f"[download] Piped API succeeded: {title}")
         return filepath, title
 
-    # --- 2. Fall back to yt-dlp ---
-    print("[download] Piped failed, trying yt-dlp...")
+    # --- 2. Try Invidious API ---
+    print("[download] Piped failed, trying Invidious API...")
+    filepath, title = _download_via_invidious(url, output_dir)
+    if filepath:
+        print(f"[download] Invidious API succeeded: {title}")
+        return filepath, title
+
+    # --- 3. Fall back to yt-dlp ---
+    print("[download] Invidious failed, trying yt-dlp...")
     filepath, title = _download_via_ytdlp(url, output_dir)
     if filepath:
         print(f"[download] yt-dlp succeeded: {title}")
@@ -258,6 +422,10 @@ def download_audio(url: str, output_dir: Path) -> tuple[str | None, str | None]:
     print("[download] All download methods failed")
     return None, None
 
+
+# ---------------------------------------------------------------------------
+# Audio processing utilities (unchanged)
+# ---------------------------------------------------------------------------
 
 def slow_down_audio(
     input_path: str, output_path: str, speed_factor: float = 0.75
