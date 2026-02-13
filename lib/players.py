@@ -1,29 +1,43 @@
 # lib/players.py
-"""HTML/JS player components with base64 audio."""
+"""HTML/JS player components.
+
+Audio is served via public Supabase Storage URLs — no more base64 encoding.
+This is faster, uses less memory, and lets the browser stream large files.
+"""
+
+from __future__ import annotations
 
 import json
-import os
 import time
-import base64
 import streamlit as st
-from config import AUDIO_FILES_STORAGE_ROOT_ABS_PATH
+from lib.storage import get_public_url
 
+
+# ---------------------------------------------------------------------------
+# Audio URL helper
+# ---------------------------------------------------------------------------
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def load_audio_base64(filepath: str) -> str:
-    """Read file, return base64 string. Cached so it doesn't re-encode on every rerun."""
-    if not filepath or not os.path.exists(filepath):
+def _audio_url(storage_path: str | None) -> str:
+    """Return the public URL for an audio file in Supabase Storage.
+    Returns empty string if path is None/empty."""
+    if not storage_path:
         return ""
-    with open(filepath, "rb") as f:
-        return base64.b64encode(f.read()).decode()
+    return get_public_url(storage_path)
 
 
-def _full_path(video_dir_name, filename):
-    return str(AUDIO_FILES_STORAGE_ROOT_ABS_PATH / video_dir_name / filename)
+def _full_audio_url(video_dir: str, filename: str) -> str:
+    """Build the storage path and return the public URL for a full audio file."""
+    if not video_dir or not filename:
+        return ""
+    return _audio_url(f"{video_dir}/{filename}")
 
 
-def _phrase_path(video_dir_name, filename):
-    return str(AUDIO_FILES_STORAGE_ROOT_ABS_PATH / video_dir_name / "phrases" / filename)
+def _phrase_audio_url(video_dir: str, filename: str | None) -> str:
+    """Build the storage path and return the public URL for a phrase clip."""
+    if not video_dir or not filename:
+        return ""
+    return _audio_url(f"{video_dir}/phrases/{filename}")
 
 
 # ---------------------------------------------------------------------------
@@ -40,8 +54,8 @@ def create_synchronized_player(
         st.warning("Audio file information missing.")
         return
 
-    b64 = load_audio_base64(_full_path(video_dir_name, audio_filename))
-    if not b64:
+    audio_src = _full_audio_url(video_dir_name, audio_filename)
+    if not audio_src:
         st.warning("Audio file not found.")
         return
 
@@ -50,8 +64,9 @@ def create_synchronized_player(
 
     html = f"""
     <div style="width:100%;font-family:sans-serif;">
-        <audio id="audio-{pid}" controls style="width:100%;" preload="metadata">
-            <source src="data:audio/mp3;base64,{b64}" type="audio/mp3">
+        <audio id="audio-{pid}" controls style="width:100%;" preload="metadata"
+               crossorigin="anonymous">
+            <source src="{audio_src}" type="audio/mpeg">
         </audio>
         <div id="text-{pid}"
              style="margin-top:10px;font-size:18px;line-height:1.8;
@@ -155,9 +170,12 @@ def create_phrase_player_html(
 
     audio_tag = ""
     if phrase_audio_filename and video_dir_name:
-        b64 = load_audio_base64(_phrase_path(video_dir_name, phrase_audio_filename))
-        if b64:
-            audio_tag = f'<audio id="{aid}" loop preload="none"><source src="data:audio/mp3;base64,{b64}" type="audio/mp3"></audio>'
+        src = _phrase_audio_url(video_dir_name, phrase_audio_filename)
+        if src:
+            audio_tag = (
+                f'<audio id="{aid}" loop preload="none" crossorigin="anonymous">'
+                f'<source src="{src}" type="audio/mpeg"></audio>'
+            )
 
     return f"""
     <div class="phrase-player">
@@ -260,19 +278,18 @@ def generate_breakdown_html(
         uid = f"S{segment_id}_P{i}"
 
         parts.append(create_phrase_player_html(
-            video_dir_name, phrase_audio_map.get(i), phrase_sync_words_map.get(i, []), uid, kanji_map
+            video_dir_name, phrase_audio_map.get(i),
+            phrase_sync_words_map.get(i, []), uid, kanji_map,
         ))
 
         font = '-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif'
 
-        # Korean meaning right below the Japanese phrase
         if phrase.get("meaning"):
             parts.append(
                 f"<div style='margin-top:0;margin-bottom:12px;font-family:{font};'>"
                 f"<p style='font-size:20px;line-height:1.6;margin:0;color:#555;'>{phrase['meaning']}</p></div>"
             )
 
-        # Build a lookup: for each word, find its kanji explanations (meaning only, no reading)
         kanji_explanations = phrase.get("kanji_explanations", [])
         ke_lookup = {}
         for ke in kanji_explanations:
@@ -281,7 +298,6 @@ def generate_breakdown_html(
             if ch:
                 ke_lookup[ch] = meaning
 
-        # Check if ANY word in the phrase has kanji
         has_any_kanji = any(w.get("kanji") for w in phrase.get("words", []))
 
         th_style = "border:1px solid #e0e0e0;padding:8px 12px;text-align:left;background-color:#f2f2f2;font-size:15px;"
@@ -302,7 +318,6 @@ def generate_breakdown_html(
             table += f"<td style='{td_style}'>{w.get('romaji', '')}</td>"
             table += f"<td style='{td_style}'>{w.get('meaning', '')}</td>"
             if has_any_kanji:
-                # Build kanji cell: only actual kanji characters (filter out hiragana/katakana)
                 kanji_str = w.get("kanji", "")
                 if kanji_str:
                     kanji_parts = []
@@ -330,7 +345,7 @@ def generate_breakdown_html(
         if i < len(phrases_data) - 1:
             parts.append("<hr style='margin-top:15px;margin-bottom:15px;border:0;height:1px;background-color:#e0e0e0;'>")
 
-    # Auto-resize via Streamlit's postMessage API
+    # Auto-resize
     parts.append("""
     <script>
     (function(){
@@ -351,14 +366,11 @@ def generate_breakdown_html(
 
 
 def estimate_segment_height(phrases: list[dict]) -> int:
-    """Height estimate per segment - slightly generous to avoid clipping."""
     total = 30
     for p in phrases:
-        # phrase text ~60px + meaning ~40px + table header ~42px + margin/padding ~30px
         total += 60 + 40 + 42 + 30
         word_rows = max(1, len(p.get("words", [])))
         total += word_rows * 40
-        # hr between phrases
         total += 20
     return max(200, total)
 
@@ -372,12 +384,13 @@ def create_vocab_component(
     video_dir_name: str,
     audio_filename: str | None,
 ) -> str:
-    sorted_items = sorted(vocab_map.items(), key=lambda kv: float("inf") if kv[1]["start"] is None else kv[1]["start"])
+    sorted_items = sorted(
+        vocab_map.items(),
+        key=lambda kv: float("inf") if kv[1]["start"] is None else kv[1]["start"],
+    )
 
-    # Same file as transcript player → cache hit, no re-encode
-    audio_b64 = ""
-    if audio_filename and video_dir_name:
-        audio_b64 = load_audio_base64(_full_path(video_dir_name, audio_filename))
+    # Get public URL for the full slowed audio
+    audio_src = _full_audio_url(video_dir_name, audio_filename) if audio_filename else ""
 
     html = """
     <style>
@@ -394,20 +407,20 @@ def create_vocab_component(
     </style>
     """
 
-    if audio_b64:
-        html += f'<audio id="vocab-aud" preload="metadata"><source src="data:audio/mp3;base64,{audio_b64}" type="audio/mp3"></audio>'
+    if audio_src:
+        html += f'<audio id="vocab-aud" preload="metadata" crossorigin="anonymous"><source src="{audio_src}" type="audio/mpeg"></audio>'
     else:
         html += '<audio id="vocab-aud"></audio>'
 
-    html += """
-    <div class="vocab-grid">
-    """
+    html += '<div class="vocab-grid">'
 
     for jp, info in sorted_items:
         jp_display = jp
         for kanji, reading in info.get("kanji_readings", {}).items():
             if kanji in jp_display:
-                jp_display = jp_display.replace(kanji, f"<ruby>{kanji}<rt>{reading}</rt></ruby>")
+                jp_display = jp_display.replace(
+                    kanji, f"<ruby>{kanji}<rt>{reading}</rt></ruby>"
+                )
 
         start, end = info.get("start"), info.get("end")
         has_timing = start is not None and end is not None

@@ -1,30 +1,26 @@
-# jp.py - Main Streamlit Application
-"""Japanese Learner App - Main entry point.
+# jp.py — Main Streamlit Application
+"""Japanese Learner App — Cloud version.
 
-Thin UI layer. All logic in lib/ modules.
+Streamlit Cloud + Supabase (PostgreSQL + Storage).
+Thin UI layer.  All logic in lib/ modules.
 """
+
+from __future__ import annotations
 
 import streamlit as st
 import json
-import os
 import time
 import tempfile
-import shutil
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from dotenv import load_dotenv
-
-# Load environment variables FIRST
-load_dotenv()
 
 # Page config (must be first st call)
-st.set_page_config(page_title="日本語")
+st.set_page_config(layout="centered", page_title="日本語")
+
 
 # --- Imports from lib ---
-from config import AUDIO_FILES_STORAGE_ROOT_ABS_PATH
 from lib.database import (
-    get_db_connection,
     get_all_videos,
     get_video_by_url,
     get_video_by_id,
@@ -32,6 +28,7 @@ from lib.database import (
     update_video_directory,
     update_video_audio,
     update_video_transcript,
+    update_video_debug,
     delete_video,
     insert_segment,
     get_segments_for_video,
@@ -42,6 +39,7 @@ from lib.database import (
     load_kanji_first_occurrences,
     batch_insert_phrase_analyses,
 )
+from lib.storage import upload_audio, delete_storage_folder
 from lib.audio import download_audio, slow_down_audio, create_phrase_audio_clips
 from lib.analysis import (
     transcribe_audio,
@@ -60,65 +58,42 @@ from lib.players import (
 
 
 # ---------------------------------------------------------------------------
-# Streamlit caching
+# Streamlit caching — wraps Supabase queries with TTL
 # ---------------------------------------------------------------------------
 
-@st.cache_resource
-def cached_db_connection():
-    """Cached database connection (one per session)."""
-    return get_db_connection()
+@st.cache_data(ttl=600)
+def cached_segments(video_id: int) -> list[dict]:
+    return get_segments_for_video(video_id)
 
 
 @st.cache_data(ttl=600)
-def cached_segments(video_id: int):
-    conn = get_db_connection()
-    rows = get_segments_for_video(conn, video_id)
-    result = [dict(r) for r in rows]
-    conn.close()
-    return result
+def cached_phrase_analyses(segment_id: int) -> list[dict]:
+    return get_phrase_analyses_for_segment(segment_id)
 
 
 @st.cache_data(ttl=600)
-def cached_phrase_analyses(segment_id: int):
-    conn = get_db_connection()
-    rows = get_phrase_analyses_for_segment(conn, segment_id)
-    result = [dict(r) for r in rows]
-    conn.close()
-    return result
+def cached_kanji(video_id: int) -> list[dict]:
+    return get_kanji_for_video(video_id)
 
 
 @st.cache_data(ttl=600)
-def cached_kanji(video_id: int):
-    conn = get_db_connection()
-    rows = get_kanji_for_video(conn, video_id)
-    result = [dict(r) for r in rows]
-    conn.close()
-    return result
-
-
-@st.cache_data(ttl=600)
-def cached_kanji_order(video_id: int):
-    conn = get_db_connection()
-    result = load_kanji_first_occurrences(conn, video_id)
-    conn.close()
-    return result
+def cached_kanji_order(video_id: int) -> dict:
+    return load_kanji_first_occurrences(video_id)
 
 
 @st.cache_data(ttl=600)
 def cached_vocab_map(video_id: int) -> dict:
     """Reconstruct vocabulary map from database."""
-    conn = get_db_connection()
-    rows = get_all_phrase_analyses_for_video(conn, video_id)
-    vocab = {}
+    rows = get_all_phrase_analyses_for_video(video_id)
+    vocab: dict = {}
     for row in rows:
-        phrase_data = json.loads(row["gpt_phrase_json"])
-        sync_words = (
-            json.loads(row["phrase_words_for_sync_json"])
-            if row["phrase_words_for_sync_json"]
-            else None
-        )
+        phrase_data = row["gpt_phrase_json"]
+        if isinstance(phrase_data, str):
+            phrase_data = json.loads(phrase_data)
+        sync_words = row.get("phrase_words_for_sync_json")
+        if isinstance(sync_words, str):
+            sync_words = json.loads(sync_words)
         collect_vocab_with_kanji({"phrases": [phrase_data]}, vocab, sync_words)
-    conn.close()
     return vocab
 
 
@@ -180,15 +155,13 @@ div[data-testid="stHtml"]{margin-bottom:0!important;padding-bottom:0!important;}
 # ---------------------------------------------------------------------------
 
 def sidebar_history():
-    conn = get_db_connection()
-    rows = get_all_videos(conn)
-    conn.close()
+    rows = get_all_videos()
     if not rows:
         st.info("분석된 영상이 없습니다.")
         return
     st.markdown("##### 🔍 처리 내역")
     for r in rows:
-        title = r["video_title"] or r["youtube_url"]
+        title = r.get("video_title") or r.get("youtube_url", "")
         st.markdown(f"- [{title}]({r['youtube_url']})")
 
 
@@ -196,18 +169,17 @@ def sidebar_history():
 # Tab population helpers
 # ---------------------------------------------------------------------------
 
-def populate_transcript_tab(tab, video_dir: str, audio_fn: str, sync_json: str):
-    """Fill the full transcript tab."""
+def populate_transcript_tab(tab, video_dir: str, audio_fn: str, sync_words):
     with tab:
-        if audio_fn and video_dir and sync_json:
-            words = json.loads(sync_json)
+        if audio_fn and video_dir and sync_words:
+            # sync_words is already a list (JSONB → Python list via Supabase)
+            words = sync_words if isinstance(sync_words, list) else json.loads(sync_words)
             create_synchronized_player(video_dir, audio_fn, words)
         else:
             st.info("스크립트 데이터가 없습니다.")
 
 
 def populate_breakdown_tab(tab, video_id: int, video_dir: str):
-    """Fill the breakdown tab - all segments in one iframe."""
     with tab:
         segments = cached_segments(video_id)
         if not segments:
@@ -219,7 +191,6 @@ def populate_breakdown_tab(tab, video_id: int, video_dir: str):
 
         for seg in segments:
             seg_id = seg["id"]
-
             analyses = cached_phrase_analyses(seg_id)
             if not analyses:
                 continue
@@ -230,17 +201,18 @@ def populate_breakdown_tab(tab, video_id: int, video_dir: str):
 
             for a in analyses:
                 idx = a["phrase_index_in_segment"]
-                phrases_data.append(json.loads(a["gpt_phrase_json"]))
+                pd = a["gpt_phrase_json"]
+                if isinstance(pd, str):
+                    pd = json.loads(pd)
+                phrases_data.append(pd)
                 audio_map[idx] = a.get("phrase_slowed_audio_path")
-                sync_words = (
-                    json.loads(a["phrase_words_for_sync_json"])
-                    if a.get("phrase_words_for_sync_json")
-                    else []
-                )
-                sync_map[idx] = sync_words
+                sw = a.get("phrase_words_for_sync_json")
+                if isinstance(sw, str):
+                    sw = json.loads(sw)
+                sync_map[idx] = sw if sw else []
 
             html = generate_breakdown_html(
-                phrases_data, audio_map, sync_map, video_dir, seg_id
+                phrases_data, audio_map, sync_map, video_dir, seg_id,
             )
             all_html_parts.append(html)
             total_height += estimate_segment_height(phrases_data)
@@ -251,20 +223,17 @@ def populate_breakdown_tab(tab, video_id: int, video_dir: str):
 
 
 def populate_vocab_tab(tab, video_id: int, video_dir: str, audio_fn: str | None):
-    """Fill the vocabulary tab."""
     with tab:
         vocab = cached_vocab_map(video_id)
         if not vocab:
             st.info("한자가 포함된 단어가 없습니다.")
             return
-
         html = create_vocab_component(vocab, video_dir, audio_fn)
         h = min(800, len(vocab) * 150 + 200)
         st.components.v1.html(html, height=h, scrolling=True)
 
 
 def populate_kanji_tab(tab, video_id: int):
-    """Fill the kanji tab."""
     with tab:
         entries = cached_kanji(video_id)
         if not entries:
@@ -282,7 +251,7 @@ def populate_kanji_tab(tab, video_id: int):
         for idx, k in enumerate(sorted_entries):
             with cols[idx % num_cols]:
                 k_desc, h_mean = "", ""
-                meaning = k["meaning"]
+                meaning = k.get("meaning", "")
                 if " / " in meaning:
                     parts = meaning.split(" / ", 1)
                     k_desc = parts[0]
@@ -291,14 +260,13 @@ def populate_kanji_tab(tab, video_id: int):
                     k_desc = meaning
                 hanja_div = (
                     f'<div><strong></strong> <span class="value">{h_mean}</span></div>'
-                    if h_mean
-                    else ""
+                    if h_mean else ""
                 )
                 st.markdown(
                     f"""<div class="kanji-card">
                     <div class="kanji-char-display">{k['character']}</div>
                     <div class="kanji-info">
-                        <div><strong></strong><span class="value">{k['reading']}</span></div>
+                        <div><strong></strong><span class="value">{k.get('reading','')}</span></div>
                         <div><strong></strong><span class="value">{k_desc}</span></div>
                         {hanja_div}
                     </div></div>""",
@@ -320,7 +288,6 @@ def populate_text_tab(tab, full_text: str, title: str):
 
 
 def _extract_youtube_id(url: str) -> str | None:
-    """Extract video ID from various YouTube URL formats."""
     import re
     patterns = [
         r'(?:v=|/v/|youtu\.be/)([a-zA-Z0-9_-]{11})',
@@ -335,7 +302,6 @@ def _extract_youtube_id(url: str) -> str | None:
 
 
 def populate_video_tab(tab, youtube_url: str):
-    """Embed the YouTube video."""
     with tab:
         vid_id = _extract_youtube_id(youtube_url)
         if vid_id:
@@ -355,45 +321,21 @@ def populate_video_tab(tab, youtube_url: str):
 # ---------------------------------------------------------------------------
 
 def display_existing_video(video_id: int):
-    """Display all tabs for an already-analyzed video."""
-    conn = get_db_connection()
-    video = get_video_by_id(conn, video_id)
+    video = get_video_by_id(video_id)
     if not video:
         st.error("영상을 찾을 수 없습니다.")
-        conn.close()
         return
 
-    video = dict(video)
     video_dir = video.get("video_data_directory", "")
     audio_fn = video.get("full_slowed_audio_path", "")
     title = video.get("video_title", "")
 
-    # Ensure derived fields exist
-    if not video.get("full_words_for_sync_json") and video.get("raw_deepgram_response_json"):
-        raw = json.loads(video["raw_deepgram_response_json"])
-        words = extract_words_for_sync(raw)
-        conn.execute(
-            "UPDATE Videos SET full_words_for_sync_json=? WHERE id=?",
-            (json.dumps(words), video_id),
-        )
-        video["full_words_for_sync_json"] = json.dumps(words)
-        conn.commit()
-
-    if not video.get("full_transcript_text") and video.get("raw_deepgram_response_json"):
-        raw = json.loads(video["raw_deepgram_response_json"])
-        txt = raw["results"]["channels"][0]["alternatives"][0]["transcript"].replace(" ", "")
-        conn.execute("UPDATE Videos SET full_transcript_text=? WHERE id=?", (txt, video_id))
-        video["full_transcript_text"] = txt
-        conn.commit()
-
-    conn.close()
-
-    # Create tabs
     tabs = st.tabs(["스크립트", "문장", "단어", "한자", "텍스트", "VIDEO"])
     tab_script, tab_breakdown, tab_vocab, tab_kanji, tab_text, tab_video = tabs
 
     populate_transcript_tab(
-        tab_script, video_dir, audio_fn, video.get("full_words_for_sync_json", "[]")
+        tab_script, video_dir, audio_fn,
+        video.get("full_words_for_sync_json", []),
     )
     populate_breakdown_tab(tab_breakdown, video_id, video_dir)
     populate_vocab_tab(tab_vocab, video_id, video_dir, audio_fn)
@@ -407,32 +349,27 @@ def display_existing_video(video_id: int):
 # ---------------------------------------------------------------------------
 
 def run_full_pipeline(url: str, force: bool):
-    """Execute the complete analysis pipeline."""
     status = st.empty()
     status.info("1단계: 준비 중...")
 
-    conn = get_db_connection()
     temp_dir_obj = None
 
     try:
         # Check existing
-        existing = get_video_by_url(conn, url)
+        existing = get_video_by_url(url)
         if existing and not force:
             status.success(f"'{existing['video_title']}' 이미 분석됨. 결과를 표시합니다.")
             vid = existing["id"]
             st.session_state["last_video_id"] = vid
-            conn.close()
             display_existing_video(vid)
             return {"video_id": vid}
 
         if existing and force:
             status.info("재처리: 기존 데이터 삭제 중...")
-            old_dir = existing["video_data_directory"]
+            old_dir = existing.get("video_data_directory")
+            delete_video(existing["id"])
             if old_dir:
-                shutil.rmtree(
-                    AUDIO_FILES_STORAGE_ROOT_ABS_PATH / old_dir, ignore_errors=True
-                )
-            delete_video(conn, existing["id"])
+                delete_storage_folder(old_dir)
             # Clear caches
             cached_segments.clear()
             cached_phrase_analyses.clear()
@@ -450,17 +387,19 @@ def run_full_pipeline(url: str, force: bool):
             status.error("다운로드 실패.")
             return None
 
-        video_id = insert_video(conn, url, title)
+        video_id = insert_video(url, title)
         video_dir = f"video_{video_id}"
-        video_dir_abs = AUDIO_FILES_STORAGE_ROOT_ABS_PATH / video_dir
-        (video_dir_abs / "phrases").mkdir(parents=True, exist_ok=True)
-        update_video_directory(conn, video_id, video_dir)
+        update_video_directory(video_id, video_dir)
 
-        # Slow down full audio
+        # Slow down full audio (locally in temp dir)
         slowed_fn = f"full_slowed_{video_id}.mp3"
-        slowed_path = str(video_dir_abs / slowed_fn)
-        slow_down_audio(audio_path, slowed_path)
-        update_video_audio(conn, video_id, slowed_fn)
+        slowed_local = str(temp_dir / slowed_fn)
+        slow_down_audio(audio_path, slowed_local)
+
+        # Upload slowed audio to Supabase Storage
+        storage_audio_path = f"{video_dir}/{slowed_fn}"
+        upload_audio(slowed_local, storage_audio_path)
+        update_video_audio(video_id, slowed_fn)
 
         status.info("2단계: 스크립트 변환 중...")
         transcript = transcribe_audio(audio_path)
@@ -474,23 +413,14 @@ def run_full_pipeline(url: str, force: bool):
             return None
 
         sync_words = extract_words_for_sync(transcript)
-        update_video_transcript(
-            conn, video_id, json.dumps(transcript), full_text, json.dumps(sync_words)
-        )
+        update_video_transcript(video_id, transcript, full_text, sync_words)
 
         # Insert segments
         for seg_idx, seg in enumerate(segments_list):
             db_id = insert_segment(
-                conn,
-                video_id,
-                seg_idx,
-                seg["text"],
-                seg["start"],
-                seg["end"],
-                json.dumps(seg["words"]),
+                video_id, seg_idx, seg["text"], seg["start"], seg["end"], seg["words"],
             )
             seg["db_id"] = db_id
-        conn.commit()
 
         # Create tabs
         tabs = st.tabs(["스크립트", "문장", "단어", "한자", "텍스트", "VIDEO"])
@@ -507,20 +437,16 @@ def run_full_pipeline(url: str, force: bool):
         # Fill tab 6: VIDEO
         populate_video_tab(tab_video, url)
 
-        # --- Save segmentation debug immediately ---
-        seg_debug_path = video_dir_abs / "claude_segmentation.json"
-        with open(seg_debug_path, "w", encoding="utf-8") as f:
-            json.dump(seg_debug, f, ensure_ascii=False, indent=2)
+        # Save segmentation debug
+        debug_data = {"segmentation": seg_debug, "analyses": []}
 
         # --- STAGE 2: Claude analysis (concurrent) ---
         status.info("3단계: 구문 분석 시작...")
 
-        vocab_map = {}
+        vocab_map: dict = {}
         total = len(segments_list)
-        all_claude_analyses = []  # Collect raw responses for debug file
-        analysis_debug_path = video_dir_abs / "claude_analyses.json"
+        all_claude_analyses: list[dict] = []
 
-        # Pre-compute context for each segment (previous 1-2 segments)
         contexts = []
         for i in range(total):
             if i >= 2:
@@ -531,7 +457,6 @@ def run_full_pipeline(url: str, force: bool):
                 contexts.append("")
 
         def analyze_with_retry(seg_index):
-            """Analyze a segment with retry logic (rate-limit aware)."""
             seg = segments_list[seg_index]
             max_retries = 3
             last_error = None
@@ -543,22 +468,19 @@ def run_full_pipeline(url: str, force: bool):
                     )
                     if result and result.get("phrases"):
                         return (seg_index, result, None)
-                    # Empty result — retry
                     last_error = "Empty response from Claude"
                 except Exception as e:
                     last_error = str(e)
                     is_rate_limit = "429" in str(e) or "rate" in str(e).lower() or "overloaded" in str(e).lower()
                     if attempt < max_retries - 1:
                         if is_rate_limit:
-                            wait = (5 * (attempt + 1)) + (2 * seg_index % 10)  # 5-15s + stagger
+                            wait = (5 * (attempt + 1)) + (2 * seg_index % 10)
                         else:
-                            wait = (2 ** attempt) + (0.5 * attempt)  # 1s, 2.5s
+                            wait = (2 ** attempt) + (0.5 * attempt)
                         time.sleep(wait)
-            # All retries exhausted
             return (seg_index, {"phrases": []}, last_error)
 
-        # Fire all segment analyses concurrently
-        analysis_results = [None] * total
+        analysis_results: list[dict | None] = [None] * total
         completed_count = 0
 
         with ThreadPoolExecutor(max_workers=min(50, total)) as executor:
@@ -566,18 +488,21 @@ def run_full_pipeline(url: str, force: bool):
                 executor.submit(analyze_with_retry, i): i
                 for i in range(total)
             }
-
             for future in as_completed(futures):
-                seg_idx, analysis, error = future.result()
-                analysis_results[seg_idx] = analysis
+                seg_idx_done, analysis, error = future.result()
+                analysis_results[seg_idx_done] = analysis
                 completed_count += 1
                 if error:
-                    status.warning(f"세그먼트 {seg_idx+1}/{total}: 재시도 실패 - {error}")
+                    status.warning(f"세그먼트 {seg_idx_done+1}/{total}: 재시도 실패 - {error}")
                 else:
                     status.info(f"구문 분석 {completed_count}/{total} 완료...")
 
-        # Process results in order (audio clips, DB, collect HTML)
+        # --- Process results: audio clips, DB, HTML ---
         status.info("3단계: 오디오 클립 생성 및 저장 중...")
+
+        # Create temp dir for phrase clips
+        phrases_local_dir = temp_dir / "phrases"
+        phrases_local_dir.mkdir(exist_ok=True)
 
         all_html_parts = []
         total_height = 30
@@ -586,7 +511,6 @@ def run_full_pipeline(url: str, force: bool):
             db_seg_id = seg["db_id"]
             analysis = analysis_results[i]
 
-            # Save raw response for debugging
             all_claude_analyses.append({
                 "segment_index": i,
                 "segment_text": seg["text"],
@@ -602,14 +526,25 @@ def run_full_pipeline(url: str, force: bool):
                 for p in phrases
             ]
 
-            # Create phrase audio clips
+            # Create phrase audio clips locally
             audio_map = create_phrase_audio_clips(
-                audio_path, timings, video_dir_abs / "phrases", 0.75, db_seg_id
+                audio_path, timings, phrases_local_dir, 0.75, db_seg_id,
             )
 
-            # Prepare batch insert data
+            # Upload each phrase clip to Supabase Storage
+            for p_idx, local_fn in audio_map.items():
+                if local_fn:
+                    local_fp = str(phrases_local_dir / local_fn)
+                    storage_path = f"{video_dir}/phrases/{local_fn}"
+                    try:
+                        upload_audio(local_fp, storage_path)
+                    except Exception as exc:
+                        print(f"[UPLOAD] Failed phrase clip {local_fn}: {exc}")
+                        audio_map[p_idx] = None
+
+            # Prepare batch insert
             batch_rows = []
-            sync_map = {}
+            sync_map: dict[int, list] = {}
             for p_idx, p_item in enumerate(phrases):
                 p_audio_fn = audio_map.get(p_idx)
                 p_sync = extract_phrase_words_for_sync(
@@ -619,51 +554,44 @@ def run_full_pipeline(url: str, force: bool):
                 )
                 sync_map[p_idx] = p_sync
                 collect_vocab_with_kanji({"phrases": [p_item]}, vocab_map, p_sync)
-                batch_rows.append(
-                    (
-                        db_seg_id,
-                        p_idx,
-                        json.dumps(p_item),
-                        p_audio_fn,
-                        json.dumps(p_sync),
-                    )
-                )
+                batch_rows.append({
+                    "segment_id": db_seg_id,
+                    "phrase_index_in_segment": p_idx,
+                    "gpt_phrase_json": p_item,           # dict → JSONB
+                    "phrase_slowed_audio_path": p_audio_fn,
+                    "phrase_words_for_sync_json": p_sync, # list → JSONB
+                })
 
-            # Batch insert all phrases for this segment
-            batch_insert_phrase_analyses(conn, batch_rows)
-            conn.commit()
+            batch_insert_phrase_analyses(batch_rows)
 
-            # Collect HTML for combined render
+            # Collect HTML
             html = generate_breakdown_html(
-                phrases, audio_map, sync_map, video_dir, db_seg_id
+                phrases, audio_map, sync_map, video_dir, db_seg_id,
             )
             all_html_parts.append(html)
             total_height += estimate_segment_height(phrases)
 
-        # Render all segments as one single iframe (no gaps)
+        # Render breakdown
         if all_html_parts:
             with tab_breakdown:
                 combined = "".join(all_html_parts)
                 st.components.v1.html(combined, height=total_height, scrolling=False)
 
-        # Save all analyses debug file
-        with open(analysis_debug_path, "w", encoding="utf-8") as f:
-            json.dump(all_claude_analyses, f, ensure_ascii=False, indent=2)
+        # Save debug
+        debug_data["analyses"] = all_claude_analyses
+        update_video_debug(video_id, debug_data)
 
         # --- STAGE 3: Kanji & Vocab ---
         status.info("4단계: 한자 추출 중...")
-        extract_and_store_kanji(conn, video_id)
+        extract_and_store_kanji(video_id)
 
-        # Populate vocab tab
         populate_vocab_tab(tab_vocab, video_id, video_dir, slowed_fn)
-
-        # Populate kanji tab
         populate_kanji_tab(tab_kanji, video_id)
 
         status.success("모든 처리 완료!")
         st.session_state["last_video_id"] = video_id
 
-        # Clear caches to pick up new data
+        # Clear caches
         cached_segments.clear()
         cached_phrase_analyses.clear()
         cached_kanji.clear()
@@ -677,7 +605,6 @@ def run_full_pipeline(url: str, force: bool):
         traceback.print_exc()
         return None
     finally:
-        conn.close()
         if temp_dir_obj:
             try:
                 temp_dir_obj.cleanup()
@@ -691,8 +618,8 @@ def run_full_pipeline(url: str, force: bool):
 
 st.title("일본어 🇯🇵")
 
-DEEPGRAM_KEY = os.getenv("DEEPGRAM_API_KEY")
-ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY")
+DEEPGRAM_KEY = st.secrets.get("DEEPGRAM_API_KEY")
+ANTHROPIC_KEY = st.secrets.get("ANTHROPIC_API_KEY")
 
 side = st.sidebar
 choice = side.radio("", ("Home", "History", "Sources"), index=0)

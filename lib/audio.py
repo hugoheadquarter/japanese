@@ -1,5 +1,11 @@
 # lib/audio.py
-"""Audio processing: download, speed change, phrase clip extraction."""
+"""Audio processing: download, speed change, phrase clip extraction.
+
+All operations work on local temp files.  The caller (jp.py) is responsible
+for uploading final outputs to Supabase Storage.
+"""
+
+from __future__ import annotations
 
 import os
 import shutil
@@ -8,19 +14,17 @@ from pydub import AudioSegment
 
 
 def download_audio(url: str, output_dir: Path) -> tuple[str | None, str | None]:
-    """Download audio from YouTube URL. Returns (filepath, title) or (None, None)."""
+    """Download audio from YouTube URL.  Returns (filepath, title) or (None, None)."""
     import yt_dlp
 
     output_dir.mkdir(parents=True, exist_ok=True)
     ydl_opts = {
         "format": "bestaudio/best",
-        "postprocessors": [
-            {
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": "192",
-            }
-        ],
+        "postprocessors": [{
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": "mp3",
+            "preferredquality": "192",
+        }],
         "outtmpl": str(output_dir / "%(title)s.%(ext)s"),
         "verbose": False,
         "noplaylist": True,
@@ -45,18 +49,13 @@ def download_audio(url: str, output_dir: Path) -> tuple[str | None, str | None]:
 def slow_down_audio(
     input_path: str, output_path: str, speed_factor: float = 0.75
 ) -> str | None:
-    """Slow down audio using ffmpeg atempo filter.
-
-    Handles speed factors below 0.5 by chaining atempo filters.
-    Returns output path on success, None on failure.
-    """
+    """Slow down audio using ffmpeg atempo filter.  Returns output path or None."""
     try:
         inp = Path(input_path)
         out = Path(output_path)
         out.parent.mkdir(parents=True, exist_ok=True)
 
-        # Build atempo filter chain for factors < 0.5
-        # atempo only supports 0.5-2.0, so chain multiple filters
+        # atempo only supports 0.5-2.0 — chain filters for lower values
         filters = []
         remaining = speed_factor
         while remaining < 0.5:
@@ -67,14 +66,11 @@ def slow_down_audio(
 
         audio = AudioSegment.from_file(str(inp))
         temp_path = out.parent / f"_temp_{out.name}"
-        audio.export(
-            str(temp_path), format="mp3", parameters=["-filter:a", filter_str]
-        )
+        audio.export(str(temp_path), format="mp3", parameters=["-filter:a", filter_str])
         os.rename(str(temp_path), str(out))
         return str(out)
     except Exception as e:
         print(f"Slow down error: {e}")
-        # Fallback: copy original
         if os.path.exists(input_path):
             shutil.copy(input_path, output_path)
             return output_path
@@ -90,17 +86,10 @@ def create_phrase_audio_clips(
 ) -> dict[int, str | None]:
     """Extract and slow down audio clips for each phrase.
 
-    Args:
-        original_audio_path: Path to the original (non-slowed) full audio
-        phrases_with_timings: List of (start_sec, end_sec) for each phrase
-        output_dir: Directory to save phrase clips
-        speed_factor: Speed factor for slowing
-        segment_id: Used for naming files
-
-    Returns:
-        Dict mapping phrase_index -> filename (or None if failed)
+    Returns dict mapping phrase_index -> local filename (or None if failed).
+    Files are written to *output_dir*.
     """
-    result = {}
+    result: dict[int, str | None] = {}
     if not os.path.exists(original_audio_path):
         return result
 
@@ -112,7 +101,6 @@ def create_phrase_audio_clips(
             start_ms = int(start_s * 1000)
             end_ms = int(end_s * 1000)
 
-            # Reduced padding: 50ms instead of 150ms to avoid overlap
             start_ms = max(0, start_ms - 50)
             end_ms = min(len(main_audio), end_ms + 50)
 
@@ -131,7 +119,6 @@ def create_phrase_audio_clips(
 
             result[i] = final_fn if slowed else None
 
-            # Clean up temp
             try:
                 os.remove(str(temp_fp))
             except OSError:

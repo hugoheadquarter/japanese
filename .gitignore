@@ -1,29 +1,21 @@
-# Python cache
+# Secrets (never commit)
+.streamlit/secrets.toml
+
+# Python
 __pycache__/
-*.py[cod]
-
-# Virtual environment
-venv/
-
-# Environment and config files
+*.pyc
+*.pyo
 .env
-*.json
+
+# Legacy local files
+*.sqlite3
 app_config.json
+static
 
-# Temp & output directories
-temp_video_downloads/
-trash/
-
-# Logs and temporary text files
-*.log
-*.txt
-
-# Audio and media files
-*.mp3
-*.wav
-*.ogg
-*.m4a
-*.flac
-
-# MacOS metadata
+# OS
 .DS_Store
+Thumbs.db
+
+# Local dev
+venv/
+all_files/

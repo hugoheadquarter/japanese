@@ -1,0 +1,3354 @@
+===./config.py===
+# config.py
+from pathlib import Path
+import json
+
+CONFIG_FILENAME = "app_config.json"
+
+DEFAULT_CONFIG = {
+    "app_name": "JapaneseLearnerApp",
+    "base_app_data_dir": str(Path.home() / ".japaneselearnerapp_data"),
+    "audio_root_dir_name": "audio_files",
+    "db_filename": "learning_data.sqlite3",
+}
+
+
+def load_or_create_config():
+    config_path = Path(CONFIG_FILENAME)
+    if not config_path.exists():
+        with open(config_path, "w") as f:
+            json.dump(DEFAULT_CONFIG, f, indent=4)
+        return dict(DEFAULT_CONFIG)
+    with open(config_path, "r") as f:
+        return json.load(f)
+
+
+APP_CONFIG = load_or_create_config()
+
+BASE_APP_DATA_DIR = Path(APP_CONFIG["base_app_data_dir"])
+AUDIO_ROOT_DIR_NAME = APP_CONFIG["audio_root_dir_name"]
+DB_FILENAME = APP_CONFIG["db_filename"]
+
+DB_PATH = BASE_APP_DATA_DIR / DB_FILENAME
+AUDIO_FILES_STORAGE_ROOT_ABS_PATH = BASE_APP_DATA_DIR / AUDIO_ROOT_DIR_NAME
+
+# The static directory Streamlit will serve at /_app/static/
+# We symlink or point this to the audio root so files are accessible via URL.
+STATIC_DIR = Path(__file__).resolve().parent / "static"
+
+# Ensure directories exist
+BASE_APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
+AUDIO_FILES_STORAGE_ROOT_ABS_PATH.mkdir(parents=True, exist_ok=True)
+
+# Create symlink: ./static -> audio storage root
+# This lets Streamlit serve audio at /_app/static/video_X/file.mp3
+if not STATIC_DIR.exists():
+    try:
+        STATIC_DIR.symlink_to(AUDIO_FILES_STORAGE_ROOT_ABS_PATH)
+    except OSError:
+        # Fallback: if symlink fails (Windows), just use the path directly
+        STATIC_DIR = AUDIO_FILES_STORAGE_ROOT_ABS_PATH
+
+===./setup_environment.py===
+# setup_environment.py
+import sqlite3
+from pathlib import Path
+from config import DB_PATH, AUDIO_FILES_STORAGE_ROOT_ABS_PATH, BASE_APP_DATA_DIR
+
+
+def create_directories():
+    """Creates the base application data directory and audio root directory."""
+    BASE_APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    print(f"Ensured base data directory: {BASE_APP_DATA_DIR}")
+    AUDIO_FILES_STORAGE_ROOT_ABS_PATH.mkdir(parents=True, exist_ok=True)
+    print(f"Ensured audio directory: {AUDIO_FILES_STORAGE_ROOT_ABS_PATH}")
+
+
+def initialize_database():
+    """Creates the database and tables if they don't exist."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("PRAGMA journal_mode=WAL;")
+    cursor.execute("PRAGMA foreign_keys=ON;")
+
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS Videos (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        youtube_url TEXT UNIQUE NOT NULL,
+        video_title TEXT,
+        video_data_directory TEXT UNIQUE,
+        full_slowed_audio_path TEXT,
+        full_words_for_sync_json TEXT,
+        raw_deepgram_response_json TEXT,
+        full_transcript_text TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )""")
+
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS Segments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        video_id INTEGER NOT NULL,
+        segment_index INTEGER NOT NULL,
+        text TEXT,
+        start_time REAL,
+        end_time REAL,
+        deepgram_segment_words_json TEXT,
+        FOREIGN KEY (video_id) REFERENCES Videos(id) ON DELETE CASCADE,
+        UNIQUE (video_id, segment_index)
+    )""")
+
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS GptPhraseAnalyses (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        segment_id INTEGER NOT NULL,
+        phrase_index_in_segment INTEGER NOT NULL,
+        gpt_phrase_json TEXT NOT NULL,
+        phrase_slowed_audio_path TEXT,
+        phrase_words_for_sync_json TEXT,
+        FOREIGN KEY (segment_id) REFERENCES Segments(id) ON DELETE CASCADE,
+        UNIQUE (segment_id, phrase_index_in_segment)
+    )""")
+
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS KanjiEntries (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        video_id INTEGER NOT NULL,
+        character TEXT NOT NULL,
+        reading TEXT,
+        meaning TEXT,
+        FOREIGN KEY (video_id) REFERENCES Videos(id) ON DELETE CASCADE,
+        UNIQUE (video_id, character)
+    )""")
+
+    conn.commit()
+    conn.close()
+    print(f"Database initialized: {DB_PATH}")
+
+
+def main():
+    print("Setting up environment...")
+    create_directories()
+    initialize_database()
+    print("Setup complete.")
+
+
+if __name__ == "__main__":
+    main()
+
+===./app/replay.py===
+import streamlit as st, json, os
+from lib.db import _conn
+from lib.paths import path_full
+from main import create_synchronized_player, json_to_html_with_sync_players, extract_words_for_sync
+
+st.title("📚 Replay stored videos")
+
+with _conn() as db:
+    videos = db.execute("SELECT id, title FROM video ORDER BY added_at DESC").fetchall()
+
+vid_titles = {f"{row[0]} – {row[1]}": row[0] for row in videos}
+choice = st.selectbox("Choose a video", list(vid_titles.keys()))
+if not choice:
+    st.stop()
+
+vid_id = vid_titles[choice]
+
+# Fetch metadata
+with _conn() as db:
+    v = db.execute("SELECT yt_id,title,full_audio,transcript_json FROM video WHERE id=?", (vid_id,)).fetchone()
+yt_id, title, full_path, transcript_json = v
+transcript_json = json.loads(transcript_json)
+
+# Rebuild word timings (one shot)
+words = extract_words_for_sync(transcript_json, 0.75, 0.3)
+
+tab1, tab2, tab3 = st.tabs(["Whole clip", "Breakdown", "Kanji"])
+
+with tab1:
+    if os.path.exists(full_path):
+        create_synchronized_player(full_path, words, height=800)
+    else:
+        st.error("Audio file missing.")
+
+with _conn() as db:
+    segments = db.execute(
+        "SELECT id,idx,audio_path,analysis_json FROM segment WHERE video_id=? ORDER BY idx",
+        (vid_id,)
+    ).fetchall()
+
+with tab2:
+    for seg in segments:
+        sid, seg_idx, seg_audio, analysis_json = seg
+        analysis_json = json.loads(analysis_json)
+        # phrase audio paths
+        phr_files = {}
+        for phr in analysis_json["phrases"]:
+            p_idx = phr["number"] - 1
+            phr_files[p_idx] = f"app/media/{yt_id}/phr_{seg_idx}_{p_idx}.mp3"
+
+        html = json_to_html_with_sync_players(analysis_json, phr_files, transcript_json)
+        st.components.v1.html(html, height=400*len(analysis_json["phrases"]), scrolling=True)
+        st.markdown("---")
+
+with tab3:
+    kanji_rows = _conn().execute(
+        """SELECT DISTINCT k.* FROM kanji k
+           JOIN phrase_kanji pk ON pk.kanji=k.kanji
+           JOIN phrase p ON p.id = pk.phrase_id
+           JOIN segment s ON s.id = p.segment_id
+           WHERE s.video_id=?""",
+        (vid_id,)
+    ).fetchall()
+    for k in kanji_rows:
+        st.write(k)
+
+===./app/lib/db.py===
+import sqlite3, json, hashlib, shutil
+from pathlib import Path
+from .settings import MEDIA_ROOT
+
+_DB_PATH = "database.db"
+
+def _conn():
+    return sqlite3.connect(_DB_PATH, isolation_level=None,
+                           detect_types=sqlite3.PARSE_DECLTYPES)
+
+# ---------- insert helpers ----------
+def upsert_video(yt_id, title, transcript_json, full_audio_src: Path):
+    dest = MEDIA_ROOT / yt_id / "full_0.75.mp3"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(full_audio_src), dest)
+
+    with _conn() as db:
+        vid = db.execute(
+            """INSERT INTO video(yt_id,title,full_audio,transcript_json)
+               VALUES(?,?,?,?)
+               ON CONFLICT(yt_id) DO UPDATE
+               SET title=excluded.title,
+                   full_audio=excluded.full_audio,
+                   transcript_json=excluded.transcript_json
+            """,
+            (yt_id, title, str(dest), json.dumps(transcript_json))
+        ).lastrowid
+    return vid
+
+def insert_segment(vid, idx, start, end, text, seg_audio_src: Path, analysis_json):
+    dest = MEDIA_ROOT / get_yt(vid) / f"seg_{idx}.mp3"
+    shutil.move(str(seg_audio_src), dest)
+    with _conn() as db:
+        sid = db.execute(
+            """INSERT INTO segment(video_id,idx,start_sec,end_sec,text,audio_path,analysis_json)
+               VALUES(?,?,?,?,?,?,?)
+               ON CONFLICT(video_id,idx) DO UPDATE
+               SET start_sec=excluded.start_sec,
+                   end_sec  =excluded.end_sec,
+                   text     =excluded.text,
+                   audio_path=excluded.audio_path,
+                   analysis_json=excluded.analysis_json""",
+            (vid, idx, start, end, text, str(dest), json.dumps(analysis_json))
+        ).lastrowid
+    return sid
+
+def insert_phrase(sid, idx, text, start, end, phr_audio_src: Path, score):
+    dest = MEDIA_ROOT / get_yt_from_segment(sid) / f"phr_{get_seg_idx(sid)}_{idx}.mp3"
+    shutil.move(str(phr_audio_src), dest)
+    with _conn() as db:
+        pid = db.execute(
+            """INSERT INTO phrase(segment_id,idx,text,start_sec,end_sec,audio_path,match_score)
+               VALUES(?,?,?,?,?,?,?)
+               ON CONFLICT(segment_id,idx) DO UPDATE
+               SET text=excluded.text,
+                   start_sec=excluded.start_sec,
+                   end_sec  =excluded.end_sec,
+                   audio_path=excluded.audio_path,
+                   match_score=excluded.match_score""",
+            (sid, idx, text, start, end, str(dest), score)
+        ).lastrowid
+    return pid
+
+def insert_word(pid, idx, w):
+    with _conn() as db:
+        db.execute(
+            "INSERT OR REPLACE INTO word(phrase_id,idx,japanese,kanji,romaji,meaning_ko)"
+            "VALUES(?,?,?,?,?,?)",
+            (pid, idx, w["japanese"], w["kanji"], w["romaji"], w["meaning"])
+        )
+
+def insert_kanji(pid, k):
+    with _conn() as db:
+        db.execute(
+            "INSERT OR IGNORE INTO kanji(kanji,reading,meaning_ko,meaning_hanja)"
+            "VALUES(?,?,?,?)",
+            (k["kanji"], k["reading"],
+             k["meaning"].split(' / ')[0],
+             k["meaning"].split(' / ')[1] if ' / ' in k["meaning"] else '')
+        )
+        db.execute(
+            "INSERT OR IGNORE INTO phrase_kanji(phrase_id, kanji) VALUES (?,?)",
+            (pid, k["kanji"])
+        )
+
+# ---------- convenience ----------
+def get_yt(video_id: int) -> str:
+    with _conn() as db:
+        return db.execute("SELECT yt_id FROM video WHERE id=?", (video_id,)).fetchone()[0]
+
+def get_yt_from_segment(segment_id):
+    with _conn() as db:
+        return db.execute(
+            """SELECT v.yt_id FROM video v
+               JOIN segment s ON s.video_id = v.id
+               WHERE s.id=?""",
+            (segment_id,)
+        ).fetchone()[0]
+
+def get_seg_idx(segment_id):
+    with _conn() as db:
+        return db.execute("SELECT idx FROM segment WHERE id=?", (segment_id,)).fetchone()[0]
+
+===./app/lib/paths.py===
+from pathlib import Path
+from .settings import MEDIA_ROOT
+
+def path_full(yt_id: str) -> Path:
+    return MEDIA_ROOT / yt_id / "full_0.75.mp3"
+
+def path_seg(yt_id: str, seg_idx: int) -> Path:
+    return MEDIA_ROOT / yt_id / f"seg_{seg_idx}.mp3"
+
+def path_phr(yt_id: str, seg_idx: int, phr_idx: int) -> Path:
+    return MEDIA_ROOT / yt_id / f"phr_{seg_idx}_{phr_idx}.mp3"
+
+===./app/lib/settings.py===
+from pathlib import Path
+MEDIA_ROOT = Path(__file__).resolve().parents[2] / "media"
+MEDIA_ROOT.mkdir(parents=True, exist_ok=True)
+
+===./app/main.py===
+
+===./test.py===
+# minimal_test.py
+import streamlit as st
+
+st.title("Minimal Script Test")
+
+SIMPLE_TEST_SCRIPT_TEMPLATE = """
+<script>
+    console.log("--- MINIMAL APP: SIMPLE JS TEST SCRIPT EXECUTING ---");
+    alert("Minimal App: Simple JS Test Script Loaded!");
+</script>
+"""
+if st.button("Inject Simple Script"):
+    st.markdown(SIMPLE_TEST_SCRIPT_TEMPLATE, unsafe_allow_html=True)
+    st.write("Simple script should have been injected above.")
+===./review.py===
+# review.py - Review / Replay page
+"""Review previously analyzed videos. Imports shared lib modules."""
+
+import streamlit as st
+import json
+import shutil
+from config import AUDIO_FILES_STORAGE_ROOT_ABS_PATH
+from lib.database import (
+    get_db_connection,
+    get_all_videos,
+    get_video_by_id,
+    delete_video,
+    get_segments_for_video,
+    get_phrase_analyses_for_segment,
+    get_all_phrase_analyses_for_video,
+    get_kanji_for_video,
+    load_kanji_first_occurrences,
+)
+from lib.analysis import (
+    extract_words_for_sync,
+    extract_phrase_words_for_sync,
+    collect_vocab_with_kanji,
+)
+from lib.players import (
+    create_synchronized_player,
+    generate_breakdown_html,
+    estimate_segment_height,
+    create_vocab_component,
+)
+
+st.set_page_config(layout="wide", page_title="복습")
+
+
+# --- Caching (same pattern as jp.py) ---
+@st.cache_data(ttl=600)
+def _cached_segments(video_id):
+    conn = get_db_connection()
+    result = [dict(r) for r in get_segments_for_video(conn, video_id)]
+    conn.close()
+    return result
+
+
+@st.cache_data(ttl=600)
+def _cached_phrases(segment_id):
+    conn = get_db_connection()
+    result = [dict(r) for r in get_phrase_analyses_for_segment(conn, segment_id)]
+    conn.close()
+    return result
+
+
+@st.cache_data(ttl=600)
+def _cached_kanji(video_id):
+    conn = get_db_connection()
+    result = [dict(r) for r in get_kanji_for_video(conn, video_id)]
+    conn.close()
+    return result
+
+
+@st.cache_data(ttl=600)
+def _cached_vocab(video_id):
+    conn = get_db_connection()
+    rows = get_all_phrase_analyses_for_video(conn, video_id)
+    vocab = {}
+    for row in rows:
+        pd = json.loads(row["gpt_phrase_json"])
+        sw = json.loads(row["phrase_words_for_sync_json"]) if row["phrase_words_for_sync_json"] else None
+        collect_vocab_with_kanji({"phrases": [pd]}, vocab, sw)
+    conn.close()
+    return vocab
+
+
+# --- CSS (minimal, shared styles) ---
+st.markdown("""
+<style>
+.phrase-player audio{display:none!important;}
+div[data-testid="stHtml"]{margin-bottom:0!important;padding-bottom:0!important;}
+.stHtml{margin-bottom:0!important;padding-bottom:0!important;}
+.element-container:has(iframe){margin-bottom:0!important;padding-bottom:0!important;}
+rt{font-size:0.7em;opacity:0.9;user-select:none;}
+ul.kanji-list{padding-left:0!important;list-style-type:none!important;}
+.kanji-card-container{padding-top:10px;}
+.kanji-card{border:1px solid #e0e0e0;padding:20px;margin-bottom:20px;border-radius:10px;
+    background:#fff;display:flex;align-items:center;transition:box-shadow 0.2s,transform 0.2s;
+    height:180px;box-sizing:border-box;}
+.kanji-card:hover{box-shadow:0 8px 16px rgba(0,0,0,0.15);transform:translateY(-3px);}
+.kanji-char-display{font-size:4em;font-weight:bold;margin-right:25px;min-width:80px;
+    text-align:center;color:#2c3e50;line-height:1;}
+.kanji-info{display:flex;flex-direction:column;justify-content:center;font-size:1.1em;flex-grow:1;}
+.kanji-info div{margin-bottom:8px;line-height:1.5;display:flex;align-items:baseline;}
+.kanji-info strong{font-weight:500;color:#6c757d;margin-right:8px;}
+.kanji-info .value{font-weight:600;color:#343a40;}
+</style>
+""", unsafe_allow_html=True)
+
+
+# --- State ---
+if "sel_vid" not in st.session_state:
+    st.session_state.sel_vid = None
+if "confirm_del" not in st.session_state:
+    st.session_state.confirm_del = None
+
+
+# --- Sidebar ---
+st.sidebar.title("복습")
+conn = get_db_connection()
+videos = get_all_videos(conn)
+conn.close()
+
+if not videos:
+    st.sidebar.info("분석된 영상이 없습니다.")
+    st.stop()
+
+options = {None: "--- 영상 선택 ---"}
+for v in videos:
+    t = v["video_title"] or f"Video ID: {v['id']}"
+    options[v["id"]] = f"{t[:50]}{'...' if len(t)>50 else ''}"
+
+chosen = st.sidebar.selectbox(
+    "영상 목록:",
+    list(options.keys()),
+    format_func=lambda k: options[k],
+    key="review_select",
+)
+
+if chosen is not None:
+    if st.session_state.sel_vid != chosen:
+        st.session_state.confirm_del = None
+    st.session_state.sel_vid = chosen
+
+if st.session_state.sel_vid is None:
+    st.info("왼쪽 사이드바에서 영상을 선택해주세요.")
+    st.stop()
+
+
+# --- Main content ---
+vid_id = st.session_state.sel_vid
+conn = get_db_connection()
+video = get_video_by_id(conn, vid_id)
+conn.close()
+
+if not video:
+    st.error("영상을 찾을 수 없습니다.")
+    st.session_state.sel_vid = None
+    st.rerun()
+
+video = dict(video)
+video_dir = video.get("video_data_directory", "")
+audio_fn = video.get("full_slowed_audio_path", "")
+title = video.get("video_title", "")
+
+# Header with delete
+col1, col2 = st.columns([0.85, 0.15])
+with col1:
+    st.caption(title)
+with col2:
+    if st.button("🗑️ Delete", key=f"del_{vid_id}"):
+        st.session_state.confirm_del = vid_id
+
+# Delete confirmation
+if st.session_state.confirm_del == vid_id:
+    st.warning(f"'{title}' 의 모든 데이터를 영구 삭제하시겠습니까?")
+    c1, c2, _ = st.columns([1, 1, 5])
+    if c1.button("Yes, Delete", key=f"yes_del_{vid_id}"):
+        conn = get_db_connection()
+        delete_video(conn, vid_id)
+        conn.close()
+        if video_dir:
+            d = AUDIO_FILES_STORAGE_ROOT_ABS_PATH / video_dir
+            if d.exists():
+                shutil.rmtree(d)
+        st.session_state.sel_vid = None
+        st.session_state.confirm_del = None
+        _cached_segments.clear()
+        _cached_phrases.clear()
+        _cached_kanji.clear()
+        _cached_vocab.clear()
+        st.rerun()
+    if c2.button("Cancel", key=f"cancel_del_{vid_id}"):
+        st.session_state.confirm_del = None
+        st.rerun()
+    st.stop()
+
+
+# --- Tabs ---
+tabs = st.tabs(["Full Transcript", "Breakdown", "단어", "Kanji", "Text", "VIDEO"])
+tab1, tab2, tab_vocab, tab3, tab4, tab_video = tabs
+
+
+# Tab 1: Full transcript
+with tab1:
+    sync_json = video.get("full_words_for_sync_json")
+    if audio_fn and video_dir and sync_json:
+        words = json.loads(sync_json)
+        create_synchronized_player(video_dir, audio_fn, words)
+    else:
+        st.info("Audio or transcript data missing.")
+
+
+# Tab 2: Breakdown (all segments in one iframe)
+with tab2:
+    segments = _cached_segments(vid_id)
+    all_html_parts = []
+    total_height = 30
+    for seg in segments:
+        seg_id = seg["id"]
+
+        analyses = _cached_phrases(seg_id)
+        if not analyses:
+            continue
+
+        phrases_data = []
+        audio_map = {}
+        sync_map = {}
+        for a in analyses:
+            idx = a["phrase_index_in_segment"]
+            phrases_data.append(json.loads(a["gpt_phrase_json"]))
+            audio_map[idx] = a.get("phrase_slowed_audio_path")
+            sw = json.loads(a["phrase_words_for_sync_json"]) if a.get("phrase_words_for_sync_json") else []
+            sync_map[idx] = sw
+
+        html = generate_breakdown_html(phrases_data, audio_map, sync_map, video_dir, seg_id)
+        all_html_parts.append(html)
+        total_height += estimate_segment_height(phrases_data)
+
+    if all_html_parts:
+        combined = "".join(all_html_parts)
+        st.components.v1.html(combined, height=total_height, scrolling=False)
+
+
+# Tab 3 (vocab): 단어
+with tab_vocab:
+    vocab = _cached_vocab(vid_id)
+    if not vocab:
+        st.info("한자가 포함된 단어가 없습니다.")
+    else:
+        html = create_vocab_component(vocab, video_dir, audio_fn)
+        h = min(800, len(vocab) * 150 + 200)
+        st.components.v1.html(html, height=h, scrolling=True)
+
+
+# Tab 4: Kanji
+with tab3:
+    entries = _cached_kanji(vid_id)
+    if entries:
+        conn = get_db_connection()
+        order = load_kanji_first_occurrences(conn, vid_id)
+        conn.close()
+        sorted_k = sorted(entries, key=lambda r: order.get(r["character"], (float("inf"), 0)))
+        cols = st.columns(4)
+        st.markdown('<div class="kanji-card-container">', unsafe_allow_html=True)
+        for idx, k in enumerate(sorted_k):
+            with cols[idx % 4]:
+                k_desc, h_mean = "", ""
+                meaning = k["meaning"]
+                if " / " in meaning:
+                    parts = meaning.split(" / ", 1)
+                    k_desc = parts[0]
+                    h_mean = parts[1] if len(parts) > 1 else ""
+                else:
+                    k_desc = meaning
+                hanja = f'<div><span class="value">{h_mean}</span></div>' if h_mean else ""
+                st.markdown(
+                    f"""<div class="kanji-card"><div class="kanji-char-display">{k['character']}</div>
+                    <div class="kanji-info"><div><span class="value">{k['reading']}</span></div>
+                    <div><span class="value">{k_desc}</span></div>{hanja}</div></div>""",
+                    unsafe_allow_html=True,
+                )
+        st.markdown("</div>", unsafe_allow_html=True)
+
+
+# Tab 5: Text
+with tab4:
+    ft = video.get("full_transcript_text")
+    if ft:
+        st.text_area("", ft, height=300, label_visibility="collapsed")
+        st.download_button("Download", ft.encode("utf-8"), f"{title}_text.txt", "text/plain")
+
+
+# Tab 6: JSON
+
+# Tab 6: VIDEO
+with tab_video:
+    import re as _re
+    yt_url = video.get("youtube_url", "")
+    yt_match = _re.search(r'(?:v=|/v/|youtu\.be/)([a-zA-Z0-9_-]{11})', yt_url)
+    if yt_match:
+        yt_id = yt_match.group(1)
+        st.components.v1.html(
+            f'<iframe width="100%" height="500" src="https://www.youtube.com/embed/{yt_id}" '
+            f'frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; '
+            f'gyroscope; picture-in-picture" allowfullscreen></iframe>',
+            height=520,
+        )
+    else:
+        st.warning("YouTube URL을 인식할 수 없습니다.")
+        if yt_url:
+            st.markdown(f"[YouTube에서 열기]({yt_url})")
+===./jp.py===
+# jp.py - Main Streamlit Application
+"""Japanese Learner App - Main entry point.
+
+Thin UI layer. All logic in lib/ modules.
+"""
+
+import streamlit as st
+import json
+import os
+import time
+import tempfile
+import shutil
+import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+from dotenv import load_dotenv
+
+# Load environment variables FIRST
+load_dotenv()
+
+# Page config (must be first st call)
+st.set_page_config(page_title="日本語")
+
+# --- Imports from lib ---
+from config import AUDIO_FILES_STORAGE_ROOT_ABS_PATH
+from lib.database import (
+    get_db_connection,
+    get_all_videos,
+    get_video_by_url,
+    get_video_by_id,
+    insert_video,
+    update_video_directory,
+    update_video_audio,
+    update_video_transcript,
+    delete_video,
+    insert_segment,
+    get_segments_for_video,
+    get_phrase_analyses_for_segment,
+    get_all_phrase_analyses_for_video,
+    get_kanji_for_video,
+    extract_and_store_kanji,
+    load_kanji_first_occurrences,
+    batch_insert_phrase_analyses,
+)
+from lib.audio import download_audio, slow_down_audio, create_phrase_audio_clips
+from lib.analysis import (
+    transcribe_audio,
+    prepare_japanese_segments,
+    extract_words_for_sync,
+    extract_phrase_words_for_sync,
+    analyze_japanese_segment,
+    collect_vocab_with_kanji,
+)
+from lib.players import (
+    create_synchronized_player,
+    generate_breakdown_html,
+    estimate_segment_height,
+    create_vocab_component,
+)
+
+
+# ---------------------------------------------------------------------------
+# Streamlit caching
+# ---------------------------------------------------------------------------
+
+@st.cache_resource
+def cached_db_connection():
+    """Cached database connection (one per session)."""
+    return get_db_connection()
+
+
+@st.cache_data(ttl=600)
+def cached_segments(video_id: int):
+    conn = get_db_connection()
+    rows = get_segments_for_video(conn, video_id)
+    result = [dict(r) for r in rows]
+    conn.close()
+    return result
+
+
+@st.cache_data(ttl=600)
+def cached_phrase_analyses(segment_id: int):
+    conn = get_db_connection()
+    rows = get_phrase_analyses_for_segment(conn, segment_id)
+    result = [dict(r) for r in rows]
+    conn.close()
+    return result
+
+
+@st.cache_data(ttl=600)
+def cached_kanji(video_id: int):
+    conn = get_db_connection()
+    rows = get_kanji_for_video(conn, video_id)
+    result = [dict(r) for r in rows]
+    conn.close()
+    return result
+
+
+@st.cache_data(ttl=600)
+def cached_kanji_order(video_id: int):
+    conn = get_db_connection()
+    result = load_kanji_first_occurrences(conn, video_id)
+    conn.close()
+    return result
+
+
+@st.cache_data(ttl=600)
+def cached_vocab_map(video_id: int) -> dict:
+    """Reconstruct vocabulary map from database."""
+    conn = get_db_connection()
+    rows = get_all_phrase_analyses_for_video(conn, video_id)
+    vocab = {}
+    for row in rows:
+        phrase_data = json.loads(row["gpt_phrase_json"])
+        sync_words = (
+            json.loads(row["phrase_words_for_sync_json"])
+            if row["phrase_words_for_sync_json"]
+            else None
+        )
+        collect_vocab_with_kanji({"phrases": [phrase_data]}, vocab, sync_words)
+    conn.close()
+    return vocab
+
+
+# ---------------------------------------------------------------------------
+# CSS
+# ---------------------------------------------------------------------------
+
+st.markdown(
+    """
+<style>
+body,h1,h2,h3,h4,h5,h6,p,td,th,li,div,ul,ol{
+    font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Oxygen,Ubuntu,Cantarell,'Open Sans','Helvetica Neue',sans-serif!important;}
+.stAudio{margin-bottom:0!important;width:100%!important;}
+.stAudio>div{height:40px!important;width:100%!important;}
+rt{font-size:0.7em;opacity:0.9;user-select:none;}
+.phrase-player audio{display:none!important;}
+.phrase-player div[id^="text-phr-"]{margin-top:0!important;padding-top:5px;}
+h3{font-size:18px!important;line-height:1.6!important;padding-left:10px!important;margin-top:20px!important;font-weight:600!important;}
+h2{font-size:22px!important;font-weight:bold!important;margin-bottom:15px!important;padding:8px!important;border-radius:5px!important;background-color:#f8f8f8!important;}
+table{width:100%!important;margin-bottom:15px!important;border-collapse:collapse!important;}
+th,td{border:1px solid #e0e0e0!important;padding:8px 12px!important;text-align:left!important;font-size:14px!important;line-height:1.5!important;}
+th{background-color:#f2f2f2!important;font-weight:600!important;}
+ul.kanji-list{margin-top:5px!important;padding-left:0!important;list-style-type:none!important;}
+ul.kanji-list li{font-size:14px!important;line-height:1.6!important;margin-bottom:4px!important;}
+div.meaning-paragraph p{font-size:20px!important;line-height:1.6!important;margin-top:5px!important;}
+hr{margin-top:20px!important;margin-bottom:20px!important;border:0!important;height:1px!important;background-color:#e0e0e0!important;}
+.phrase-player{margin-bottom:15px!important;border-radius:4px!important;overflow:hidden!important;}
+div[data-testid="stHtml"]{margin-bottom:0!important;padding-bottom:0!important;}
+.stHtml{margin-bottom:0!important;padding-bottom:0!important;}
+.element-container:has(iframe){margin-bottom:0!important;padding-bottom:0!important;}
+.kanji-card-container{padding-top:10px;}
+.kanji-card{border:1px solid #e0e0e0;padding:20px;margin-bottom:20px;border-radius:10px;background:#fff;
+    display:flex;align-items:center;transition:box-shadow 0.2s,transform 0.2s;height:180px;box-sizing:border-box;}
+.kanji-card:hover{box-shadow:0 8px 16px rgba(0,0,0,0.15);transform:translateY(-3px);}
+.kanji-char-display{font-size:4em;font-weight:bold;margin-right:25px;min-width:80px;text-align:center;color:#2c3e50;line-height:1;}
+.kanji-info{display:flex;flex-direction:column;justify-content:center;font-size:1.1em;flex-grow:1;}
+.kanji-info div{margin-bottom:8px;line-height:1.5;display:flex;align-items:baseline;}
+.kanji-info div:last-child{margin-bottom:0;}
+.kanji-info strong{font-weight:500;color:#6c757d;margin-right:8px;display:inline-block;}
+.kanji-info .value{font-weight:600;color:#343a40;}
+@media(prefers-color-scheme:dark){
+    th{background-color:#2e2e2e!important;}
+    th,td{border-color:#4e4e4e!important;}
+    h2{background-color:#2a2a2a!important;}
+    hr{background-color:#3e3e3e!important;}
+    .kanji-card{background-color:#262626;border-color:#444;}
+    .kanji-char-display{color:#e8e8e8;}
+    .kanji-info strong{color:#adb5bd;}
+    .kanji-info .value{color:#f1f1f1;}
+}
+</style>
+""",
+    unsafe_allow_html=True,
+)
+
+
+# ---------------------------------------------------------------------------
+# Sidebar
+# ---------------------------------------------------------------------------
+
+def sidebar_history():
+    conn = get_db_connection()
+    rows = get_all_videos(conn)
+    conn.close()
+    if not rows:
+        st.info("분석된 영상이 없습니다.")
+        return
+    st.markdown("##### 🔍 처리 내역")
+    for r in rows:
+        title = r["video_title"] or r["youtube_url"]
+        st.markdown(f"- [{title}]({r['youtube_url']})")
+
+
+# ---------------------------------------------------------------------------
+# Tab population helpers
+# ---------------------------------------------------------------------------
+
+def populate_transcript_tab(tab, video_dir: str, audio_fn: str, sync_json: str):
+    """Fill the full transcript tab."""
+    with tab:
+        if audio_fn and video_dir and sync_json:
+            words = json.loads(sync_json)
+            create_synchronized_player(video_dir, audio_fn, words)
+        else:
+            st.info("스크립트 데이터가 없습니다.")
+
+
+def populate_breakdown_tab(tab, video_id: int, video_dir: str):
+    """Fill the breakdown tab - all segments in one iframe."""
+    with tab:
+        segments = cached_segments(video_id)
+        if not segments:
+            st.info("분석 데이터가 없습니다.")
+            return
+
+        all_html_parts = []
+        total_height = 30
+
+        for seg in segments:
+            seg_id = seg["id"]
+
+            analyses = cached_phrase_analyses(seg_id)
+            if not analyses:
+                continue
+
+            phrases_data = []
+            audio_map = {}
+            sync_map = {}
+
+            for a in analyses:
+                idx = a["phrase_index_in_segment"]
+                phrases_data.append(json.loads(a["gpt_phrase_json"]))
+                audio_map[idx] = a.get("phrase_slowed_audio_path")
+                sync_words = (
+                    json.loads(a["phrase_words_for_sync_json"])
+                    if a.get("phrase_words_for_sync_json")
+                    else []
+                )
+                sync_map[idx] = sync_words
+
+            html = generate_breakdown_html(
+                phrases_data, audio_map, sync_map, video_dir, seg_id
+            )
+            all_html_parts.append(html)
+            total_height += estimate_segment_height(phrases_data)
+
+        if all_html_parts:
+            combined = "".join(all_html_parts)
+            st.components.v1.html(combined, height=total_height, scrolling=False)
+
+
+def populate_vocab_tab(tab, video_id: int, video_dir: str, audio_fn: str | None):
+    """Fill the vocabulary tab."""
+    with tab:
+        vocab = cached_vocab_map(video_id)
+        if not vocab:
+            st.info("한자가 포함된 단어가 없습니다.")
+            return
+
+        html = create_vocab_component(vocab, video_dir, audio_fn)
+        h = min(800, len(vocab) * 150 + 200)
+        st.components.v1.html(html, height=h, scrolling=True)
+
+
+def populate_kanji_tab(tab, video_id: int):
+    """Fill the kanji tab."""
+    with tab:
+        entries = cached_kanji(video_id)
+        if not entries:
+            st.info("한자 데이터가 없습니다.")
+            return
+
+        order = cached_kanji_order(video_id)
+        sorted_entries = sorted(
+            entries, key=lambda r: order.get(r["character"], (float("inf"), 0))
+        )
+
+        num_cols = 4
+        cols = st.columns(num_cols)
+        st.markdown('<div class="kanji-card-container">', unsafe_allow_html=True)
+        for idx, k in enumerate(sorted_entries):
+            with cols[idx % num_cols]:
+                k_desc, h_mean = "", ""
+                meaning = k["meaning"]
+                if " / " in meaning:
+                    parts = meaning.split(" / ", 1)
+                    k_desc = parts[0]
+                    h_mean = parts[1] if len(parts) > 1 else ""
+                else:
+                    k_desc = meaning
+                hanja_div = (
+                    f'<div><strong></strong> <span class="value">{h_mean}</span></div>'
+                    if h_mean
+                    else ""
+                )
+                st.markdown(
+                    f"""<div class="kanji-card">
+                    <div class="kanji-char-display">{k['character']}</div>
+                    <div class="kanji-info">
+                        <div><strong></strong><span class="value">{k['reading']}</span></div>
+                        <div><strong></strong><span class="value">{k_desc}</span></div>
+                        {hanja_div}
+                    </div></div>""",
+                    unsafe_allow_html=True,
+                )
+        st.markdown("</div>", unsafe_allow_html=True)
+
+
+def populate_text_tab(tab, full_text: str, title: str):
+    with tab:
+        if full_text:
+            st.text_area("전체 텍스트", full_text, height=300, label_visibility="collapsed")
+            st.download_button(
+                "Download",
+                full_text.encode("utf-8"),
+                f"{title or 'video'}_text.txt",
+                "text/plain",
+            )
+
+
+def _extract_youtube_id(url: str) -> str | None:
+    """Extract video ID from various YouTube URL formats."""
+    import re
+    patterns = [
+        r'(?:v=|/v/|youtu\.be/)([a-zA-Z0-9_-]{11})',
+        r'(?:embed/)([a-zA-Z0-9_-]{11})',
+        r'^([a-zA-Z0-9_-]{11})$',
+    ]
+    for p in patterns:
+        m = re.search(p, url)
+        if m:
+            return m.group(1)
+    return None
+
+
+def populate_video_tab(tab, youtube_url: str):
+    """Embed the YouTube video."""
+    with tab:
+        vid_id = _extract_youtube_id(youtube_url)
+        if vid_id:
+            st.components.v1.html(
+                f'<iframe width="100%" height="500" src="https://www.youtube.com/embed/{vid_id}" '
+                f'frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; '
+                f'gyroscope; picture-in-picture" allowfullscreen></iframe>',
+                height=520,
+            )
+        else:
+            st.warning("YouTube URL을 인식할 수 없습니다.")
+            st.markdown(f"[YouTube에서 열기]({youtube_url})")
+
+
+# ---------------------------------------------------------------------------
+# Display existing analysis
+# ---------------------------------------------------------------------------
+
+def display_existing_video(video_id: int):
+    """Display all tabs for an already-analyzed video."""
+    conn = get_db_connection()
+    video = get_video_by_id(conn, video_id)
+    if not video:
+        st.error("영상을 찾을 수 없습니다.")
+        conn.close()
+        return
+
+    video = dict(video)
+    video_dir = video.get("video_data_directory", "")
+    audio_fn = video.get("full_slowed_audio_path", "")
+    title = video.get("video_title", "")
+
+    # Ensure derived fields exist
+    if not video.get("full_words_for_sync_json") and video.get("raw_deepgram_response_json"):
+        raw = json.loads(video["raw_deepgram_response_json"])
+        words = extract_words_for_sync(raw)
+        conn.execute(
+            "UPDATE Videos SET full_words_for_sync_json=? WHERE id=?",
+            (json.dumps(words), video_id),
+        )
+        video["full_words_for_sync_json"] = json.dumps(words)
+        conn.commit()
+
+    if not video.get("full_transcript_text") and video.get("raw_deepgram_response_json"):
+        raw = json.loads(video["raw_deepgram_response_json"])
+        txt = raw["results"]["channels"][0]["alternatives"][0]["transcript"].replace(" ", "")
+        conn.execute("UPDATE Videos SET full_transcript_text=? WHERE id=?", (txt, video_id))
+        video["full_transcript_text"] = txt
+        conn.commit()
+
+    conn.close()
+
+    # Create tabs
+    tabs = st.tabs(["스크립트", "문장", "단어", "한자", "텍스트", "VIDEO"])
+    tab_script, tab_breakdown, tab_vocab, tab_kanji, tab_text, tab_video = tabs
+
+    populate_transcript_tab(
+        tab_script, video_dir, audio_fn, video.get("full_words_for_sync_json", "[]")
+    )
+    populate_breakdown_tab(tab_breakdown, video_id, video_dir)
+    populate_vocab_tab(tab_vocab, video_id, video_dir, audio_fn)
+    populate_kanji_tab(tab_kanji, video_id)
+    populate_text_tab(tab_text, video.get("full_transcript_text", ""), title)
+    populate_video_tab(tab_video, video.get("youtube_url", ""))
+
+
+# ---------------------------------------------------------------------------
+# Full pipeline
+# ---------------------------------------------------------------------------
+
+def run_full_pipeline(url: str, force: bool):
+    """Execute the complete analysis pipeline."""
+    status = st.empty()
+    status.info("1단계: 준비 중...")
+
+    conn = get_db_connection()
+    temp_dir_obj = None
+
+    try:
+        # Check existing
+        existing = get_video_by_url(conn, url)
+        if existing and not force:
+            status.success(f"'{existing['video_title']}' 이미 분석됨. 결과를 표시합니다.")
+            vid = existing["id"]
+            st.session_state["last_video_id"] = vid
+            conn.close()
+            display_existing_video(vid)
+            return {"video_id": vid}
+
+        if existing and force:
+            status.info("재처리: 기존 데이터 삭제 중...")
+            old_dir = existing["video_data_directory"]
+            if old_dir:
+                shutil.rmtree(
+                    AUDIO_FILES_STORAGE_ROOT_ABS_PATH / old_dir, ignore_errors=True
+                )
+            delete_video(conn, existing["id"])
+            # Clear caches
+            cached_segments.clear()
+            cached_phrase_analyses.clear()
+            cached_kanji.clear()
+            cached_kanji_order.clear()
+            cached_vocab_map.clear()
+
+        # --- STAGE 1: Download & Transcribe ---
+        status.info("1단계: 다운로드 중...")
+        temp_dir_obj = tempfile.TemporaryDirectory(prefix="yt_dl_")
+        temp_dir = Path(temp_dir_obj.name)
+
+        audio_path, title = download_audio(url, temp_dir)
+        if not audio_path:
+            status.error("다운로드 실패.")
+            return None
+
+        video_id = insert_video(conn, url, title)
+        video_dir = f"video_{video_id}"
+        video_dir_abs = AUDIO_FILES_STORAGE_ROOT_ABS_PATH / video_dir
+        (video_dir_abs / "phrases").mkdir(parents=True, exist_ok=True)
+        update_video_directory(conn, video_id, video_dir)
+
+        # Slow down full audio
+        slowed_fn = f"full_slowed_{video_id}.mp3"
+        slowed_path = str(video_dir_abs / slowed_fn)
+        slow_down_audio(audio_path, slowed_path)
+        update_video_audio(conn, video_id, slowed_fn)
+
+        status.info("2단계: 스크립트 변환 중...")
+        transcript = transcribe_audio(audio_path)
+        if not transcript:
+            status.error("스크립트 변환 실패.")
+            return None
+
+        full_text, segments_list, seg_debug = prepare_japanese_segments(transcript)
+        if full_text is None:
+            status.error("세그먼트 준비 실패.")
+            return None
+
+        sync_words = extract_words_for_sync(transcript)
+        update_video_transcript(
+            conn, video_id, json.dumps(transcript), full_text, json.dumps(sync_words)
+        )
+
+        # Insert segments
+        for seg_idx, seg in enumerate(segments_list):
+            db_id = insert_segment(
+                conn,
+                video_id,
+                seg_idx,
+                seg["text"],
+                seg["start"],
+                seg["end"],
+                json.dumps(seg["words"]),
+            )
+            seg["db_id"] = db_id
+        conn.commit()
+
+        # Create tabs
+        tabs = st.tabs(["스크립트", "문장", "단어", "한자", "텍스트", "VIDEO"])
+        tab_script, tab_breakdown, tab_vocab, tab_kanji, tab_text, tab_video = tabs
+
+        # Fill tab 1: Full transcript
+        with tab_script:
+            create_synchronized_player(video_dir, slowed_fn, sync_words)
+
+        # Fill tab 5: Text
+        with tab_text:
+            st.text_area("전체 텍스트", full_text, height=300, label_visibility="collapsed")
+
+        # Fill tab 6: VIDEO
+        populate_video_tab(tab_video, url)
+
+        # --- Save segmentation debug immediately ---
+        seg_debug_path = video_dir_abs / "claude_segmentation.json"
+        with open(seg_debug_path, "w", encoding="utf-8") as f:
+            json.dump(seg_debug, f, ensure_ascii=False, indent=2)
+
+        # --- STAGE 2: Claude analysis (concurrent) ---
+        status.info("3단계: 구문 분석 시작...")
+
+        vocab_map = {}
+        total = len(segments_list)
+        all_claude_analyses = []  # Collect raw responses for debug file
+        analysis_debug_path = video_dir_abs / "claude_analyses.json"
+
+        # Pre-compute context for each segment (previous 1-2 segments)
+        contexts = []
+        for i in range(total):
+            if i >= 2:
+                contexts.append(segments_list[i-2]["text"] + " " + segments_list[i-1]["text"])
+            elif i >= 1:
+                contexts.append(segments_list[i-1]["text"])
+            else:
+                contexts.append("")
+
+        def analyze_with_retry(seg_index):
+            """Analyze a segment with retry logic (rate-limit aware)."""
+            seg = segments_list[seg_index]
+            max_retries = 3
+            last_error = None
+            for attempt in range(max_retries):
+                try:
+                    result = analyze_japanese_segment(
+                        seg["text"], seg["start"], seg["end"], seg["words"],
+                        previous_context=contexts[seg_index],
+                    )
+                    if result and result.get("phrases"):
+                        return (seg_index, result, None)
+                    # Empty result — retry
+                    last_error = "Empty response from Claude"
+                except Exception as e:
+                    last_error = str(e)
+                    is_rate_limit = "429" in str(e) or "rate" in str(e).lower() or "overloaded" in str(e).lower()
+                    if attempt < max_retries - 1:
+                        if is_rate_limit:
+                            wait = (5 * (attempt + 1)) + (2 * seg_index % 10)  # 5-15s + stagger
+                        else:
+                            wait = (2 ** attempt) + (0.5 * attempt)  # 1s, 2.5s
+                        time.sleep(wait)
+            # All retries exhausted
+            return (seg_index, {"phrases": []}, last_error)
+
+        # Fire all segment analyses concurrently
+        analysis_results = [None] * total
+        completed_count = 0
+
+        with ThreadPoolExecutor(max_workers=min(50, total)) as executor:
+            futures = {
+                executor.submit(analyze_with_retry, i): i
+                for i in range(total)
+            }
+
+            for future in as_completed(futures):
+                seg_idx, analysis, error = future.result()
+                analysis_results[seg_idx] = analysis
+                completed_count += 1
+                if error:
+                    status.warning(f"세그먼트 {seg_idx+1}/{total}: 재시도 실패 - {error}")
+                else:
+                    status.info(f"구문 분석 {completed_count}/{total} 완료...")
+
+        # Process results in order (audio clips, DB, collect HTML)
+        status.info("3단계: 오디오 클립 생성 및 저장 중...")
+
+        all_html_parts = []
+        total_height = 30
+
+        for i, seg in enumerate(segments_list):
+            db_seg_id = seg["db_id"]
+            analysis = analysis_results[i]
+
+            # Save raw response for debugging
+            all_claude_analyses.append({
+                "segment_index": i,
+                "segment_text": seg["text"],
+                "claude_response": analysis,
+            })
+
+            phrases = analysis.get("phrases", [])
+            if not phrases:
+                continue
+
+            timings = [
+                (p.get("original_start_time", 0), p.get("original_end_time", 0))
+                for p in phrases
+            ]
+
+            # Create phrase audio clips
+            audio_map = create_phrase_audio_clips(
+                audio_path, timings, video_dir_abs / "phrases", 0.75, db_seg_id
+            )
+
+            # Prepare batch insert data
+            batch_rows = []
+            sync_map = {}
+            for p_idx, p_item in enumerate(phrases):
+                p_audio_fn = audio_map.get(p_idx)
+                p_sync = extract_phrase_words_for_sync(
+                    transcript,
+                    p_item.get("original_start_time", 0),
+                    p_item.get("original_end_time", 0),
+                )
+                sync_map[p_idx] = p_sync
+                collect_vocab_with_kanji({"phrases": [p_item]}, vocab_map, p_sync)
+                batch_rows.append(
+                    (
+                        db_seg_id,
+                        p_idx,
+                        json.dumps(p_item),
+                        p_audio_fn,
+                        json.dumps(p_sync),
+                    )
+                )
+
+            # Batch insert all phrases for this segment
+            batch_insert_phrase_analyses(conn, batch_rows)
+            conn.commit()
+
+            # Collect HTML for combined render
+            html = generate_breakdown_html(
+                phrases, audio_map, sync_map, video_dir, db_seg_id
+            )
+            all_html_parts.append(html)
+            total_height += estimate_segment_height(phrases)
+
+        # Render all segments as one single iframe (no gaps)
+        if all_html_parts:
+            with tab_breakdown:
+                combined = "".join(all_html_parts)
+                st.components.v1.html(combined, height=total_height, scrolling=False)
+
+        # Save all analyses debug file
+        with open(analysis_debug_path, "w", encoding="utf-8") as f:
+            json.dump(all_claude_analyses, f, ensure_ascii=False, indent=2)
+
+        # --- STAGE 3: Kanji & Vocab ---
+        status.info("4단계: 한자 추출 중...")
+        extract_and_store_kanji(conn, video_id)
+
+        # Populate vocab tab
+        populate_vocab_tab(tab_vocab, video_id, video_dir, slowed_fn)
+
+        # Populate kanji tab
+        populate_kanji_tab(tab_kanji, video_id)
+
+        status.success("모든 처리 완료!")
+        st.session_state["last_video_id"] = video_id
+
+        # Clear caches to pick up new data
+        cached_segments.clear()
+        cached_phrase_analyses.clear()
+        cached_kanji.clear()
+        cached_kanji_order.clear()
+        cached_vocab_map.clear()
+
+        return {"video_id": video_id, "video_title": title}
+
+    except Exception as e:
+        status.error(f"처리 오류: {e}")
+        traceback.print_exc()
+        return None
+    finally:
+        conn.close()
+        if temp_dir_obj:
+            try:
+                temp_dir_obj.cleanup()
+            except Exception:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# Main UI
+# ---------------------------------------------------------------------------
+
+st.title("일본어 🇯🇵")
+
+DEEPGRAM_KEY = os.getenv("DEEPGRAM_API_KEY")
+ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY")
+
+side = st.sidebar
+choice = side.radio("", ("Home", "History", "Sources"), index=0)
+
+if not ANTHROPIC_KEY:
+    side.error("Anthropic API key missing.")
+if not DEEPGRAM_KEY:
+    side.error("Deepgram API key missing.")
+
+if choice == "Home":
+    url_input = side.text_input("YouTube URL:", placeholder="")
+    force = side.checkbox("재처리")
+    go = side.button("분석 시작")
+
+    if go:
+        if not url_input.strip():
+            st.warning("YouTube URL을 입력해주세요.")
+        elif not (ANTHROPIC_KEY and DEEPGRAM_KEY):
+            st.warning("API 키가 누락되었습니다.")
+        else:
+            run_full_pipeline(url_input.strip(), force)
+    elif "last_video_id" in st.session_state:
+        display_existing_video(st.session_state["last_video_id"])
+
+elif choice == "History":
+    sidebar_history()
+
+else:
+    st.markdown(
+        """
+### 📰 News
+<https://www.youtube.com/@tbsnewsdig/videos>
+
+### 🎙️ Podcast
+<https://www.youtube.com/watch?v=wqdtCeFufQc&list=PLkK7KO2TnEczjRVTgW2fSGxRgWay3Z5a4>
+
+### 🎞️ Anime
+<https://www.youtube.com/@TMSanimeJP/videos>
+"""
+    )
+===./lib/analysis.py===
+# lib/analysis.py
+"""Claude Opus 4.6 analysis, Deepgram transcription, alignment, segmentation."""
+
+import json
+import os
+import re
+import time
+import requests
+import traceback
+import anthropic
+from lib.utils import normalize_japanese, norm_for_alignment
+
+# Try to import fuzzy matching
+try:
+    from rapidfuzz import process, fuzz
+
+    FUZZY_MATCHING_AVAILABLE = True
+except ImportError:
+    FUZZY_MATCHING_AVAILABLE = False
+
+
+# ---------------------------------------------------------------------------
+# Claude client (lazy init)
+# ---------------------------------------------------------------------------
+_claude_client: anthropic.Anthropic | None = None
+
+
+def get_claude_client() -> anthropic.Anthropic | None:
+    global _claude_client
+    if _claude_client is None:
+        api_key = os.getenv("ANTHROPIC_API_KEY")
+        if api_key:
+            _claude_client = anthropic.Anthropic(api_key=api_key)
+        else:
+            print("[DIAG] ANTHROPIC_API_KEY not found in environment!")
+    return _claude_client
+
+
+# ---------------------------------------------------------------------------
+# Deepgram transcription
+# ---------------------------------------------------------------------------
+
+def transcribe_audio(audio_path: str) -> dict | None:
+    """Transcribe audio using Deepgram API."""
+    api_key = os.getenv("DEEPGRAM_API_KEY")
+    if not api_key:
+        print("Deepgram API key missing.")
+        return None
+
+    headers = {"Authorization": f"Token {api_key}", "Content-Type": "audio/mp3"}
+    url = (
+        "https://api.deepgram.com/v1/listen?"
+        "model=nova-2&language=ja&smart_format=true&punctuation=true&utterances=true"
+    )
+    try:
+        with open(audio_path, "rb") as f:
+            response = requests.post(url, headers=headers, data=f)
+        if response.status_code == 200:
+            return response.json()
+
+        print(f"Deepgram error: {response.status_code} - {response.text[:200]}")
+
+        # Fallback model
+        if "No such model" in response.text or response.status_code == 400:
+            alt_url = (
+                "https://api.deepgram.com/v1/listen?"
+                "model=general&tier=enhanced&language=ja&"
+                "smart_format=true&punctuation=true&utterances=true"
+            )
+            with open(audio_path, "rb") as f:
+                alt_resp = requests.post(alt_url, headers=headers, data=f)
+            if alt_resp.status_code == 200:
+                return alt_resp.json()
+            print(f"Deepgram fallback error: {alt_resp.status_code}")
+
+        return None
+    except Exception as e:
+        print(f"Transcription exception: {e}")
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Segmentation
+# ---------------------------------------------------------------------------
+
+SEGMENTATION_PROMPT = """You are segmenting a Japanese transcript for a beginner Korean learner.
+
+Below is a numbered word list from a speech transcript. Group these words into segments that:
+- Are complete thoughts/sentences (never split mid-clause)
+- Have 5-20 words each (ideal: 8-15)
+- Keep tiny utterances (はい、うん、ええ) attached to the sentence before or after, never alone
+- Split at natural sentence boundaries (。？！) or at commas (、) when the sentence is long
+- Consider context: a reaction like おっ！ should stay with what it's reacting to
+
+Return ONLY a JSON array of [start, end] index pairs. Every word must be covered, no gaps, no overlaps.
+
+Example input:
+[1]はい。 [2]最近 [3]は [4]無双 [5]ですから、 [6]男 [7]の [8]人 [9]も
+
+Example output:
+[[1,9]]
+
+Return ONLY the JSON array."""
+
+
+def _strip_json_fences(text: str) -> str:
+    """Remove markdown code fences wrapping JSON."""
+    text = text.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+    return text.strip()
+
+
+def _build_numbered_word_list(all_words: list[dict]) -> str:
+    """Build '[1]word [2]word ...' string from Deepgram words."""
+    parts = []
+    for i, w in enumerate(all_words):
+        text = w.get("punctuated_word", w.get("word", "")).strip()
+        parts.append(f"[{i+1}]{text}")
+    return " ".join(parts)
+
+
+def _validate_and_fix_ranges(ranges: list, total_words: int) -> list[list[int]]:
+    """Validate index ranges cover all words with no gaps/overlaps. Fix if needed."""
+    if not ranges:
+        return [[1, total_words]]
+
+    # Ensure all items are [int, int] pairs
+    clean = []
+    for r in ranges:
+        if isinstance(r, (list, tuple)) and len(r) >= 2:
+            s, e = int(r[0]), int(r[1])
+            if 1 <= s <= total_words and 1 <= e <= total_words and s <= e:
+                clean.append([s, e])
+    if not clean:
+        return [[1, total_words]]
+
+    # Sort by start
+    clean.sort(key=lambda x: x[0])
+
+    # Fix gaps and overlaps
+    fixed = [clean[0]]
+    for i in range(1, len(clean)):
+        prev_end = fixed[-1][1]
+        cur_start, cur_end = clean[i]
+
+        if cur_start != prev_end + 1:
+            cur_start = prev_end + 1
+        if cur_start > cur_end:
+            continue
+        fixed.append([cur_start, cur_end])
+
+    # Make sure we cover all words
+    if fixed[-1][1] < total_words:
+        fixed[-1][1] = total_words
+    if fixed[0][0] > 1:
+        fixed[0][0] = 1
+
+    return fixed
+
+
+def prepare_japanese_segments(
+    transcript_data: dict,
+) -> tuple[str | None, list[dict], dict]:
+    """Split transcript into segments using Claude for intelligent grouping.
+
+    Sends numbered word list to Claude, gets back index ranges.
+    Falls back to rule-based splitting if Claude fails.
+    Returns: (full_transcript, segments, segmentation_debug_info)
+    """
+    try:
+        alt = (
+            transcript_data.get("results", {})
+            .get("channels", [{}])[0]
+            .get("alternatives", [{}])[0]
+        )
+        all_words = alt.get("words", [])
+        if not all_words:
+            return "", [], {}
+
+        full_transcript = alt.get("transcript", "").replace(" ", "")
+
+        # Build numbered list for debug
+        numbered = _build_numbered_word_list(all_words)
+
+        # Try Claude segmentation
+        print(f"[SEGMENTATION] Attempting Claude segmentation for {len(all_words)} words...")
+        ranges, raw_response = _claude_segment(all_words)
+        used_fallback = False
+        if not ranges:
+            print("[SEGMENTATION] Claude returned None — using FALLBACK rule-based splitting.")
+            ranges = _fallback_segment_ranges(all_words)
+            used_fallback = True
+        else:
+            print(f"[SEGMENTATION] Claude returned {len(ranges)} segments successfully.")
+
+        # Validate and fix
+        ranges = _validate_and_fix_ranges(ranges, len(all_words))
+
+        # Build segment dicts from ranges (1-indexed -> 0-indexed)
+        segments = []
+        for s, e in ranges:
+            grp = all_words[s-1:e]
+            if not grp:
+                continue
+            seg_text = "".join(
+                w.get("punctuated_word", w.get("word", "")).strip().replace(" ", "")
+                for w in grp
+            )
+            segments.append({
+                "start": grp[0]["start"],
+                "end": grp[-1]["end"],
+                "text": seg_text,
+                "words": [dict(w) for w in grp],
+            })
+
+        debug_info = {
+            "numbered_word_list": numbered,
+            "claude_raw_response": raw_response,
+            "ranges_after_validation": ranges,
+            "used_fallback": used_fallback,
+            "total_words": len(all_words),
+            "total_segments": len(segments),
+        }
+
+        return full_transcript, segments, debug_info
+    except Exception as e:
+        print(f"Segment prep error: {e}")
+        traceback.print_exc()
+        return None, [], {}
+
+
+def _claude_segment(all_words: list[dict]) -> tuple[list[list[int]] | None, str | None]:
+    """Ask Claude to segment the numbered word list into index ranges.
+    Returns (ranges, raw_response_text).
+    """
+    client = get_claude_client()
+    if not client:
+        print("[SEGMENTATION] ERROR: Claude client is None! API key missing?")
+        return None, None
+
+    numbered = _build_numbered_word_list(all_words)
+    total = len(all_words)
+
+    print(f"[SEGMENTATION] Calling Claude API with {total} words...")
+    try:
+        message = client.messages.create(
+            model="claude-opus-4-6",
+            max_tokens=4096,
+            messages=[
+                {
+                    "role": "user",
+                    "content": f"{SEGMENTATION_PROMPT}\n\nTotal words: {total}\n\n{numbered}",
+                }
+            ],
+        )
+
+        raw_text = message.content[0].text
+        print(f"[SEGMENTATION] Claude responded ({len(raw_text)} chars): {raw_text[:200]}...")
+        response_text = _strip_json_fences(raw_text)
+        ranges = json.loads(response_text)
+
+        if isinstance(ranges, list) and len(ranges) > 0:
+            print(f"[SEGMENTATION] Parsed {len(ranges)} ranges successfully.")
+            return ranges, raw_text
+        print(f"[SEGMENTATION] Parsed result was empty or not a list: {type(ranges)}")
+        return None, raw_text
+
+    except json.JSONDecodeError as e:
+        print(f"[SEGMENTATION] JSON parse error: {e}")
+        return None, None
+    except Exception as e:
+        print(f"[SEGMENTATION] API call error: {type(e).__name__}: {e}")
+        traceback.print_exc()
+        return None, None
+
+
+def _fallback_segment_ranges(all_words: list[dict]) -> list[list[int]]:
+    """Rule-based fallback: split on 。？！ or every 20 words."""
+    ranges = []
+    start = 1
+    for i, w in enumerate(all_words):
+        idx = i + 1  # 1-indexed
+        text = w.get("punctuated_word", w.get("word", "")).strip()
+        is_punct = any(p in text for p in "。？！")
+        is_last = idx == len(all_words)
+        count = idx - start + 1
+
+        if is_punct or count >= 20 or is_last:
+            ranges.append([start, idx])
+            start = idx + 1
+
+    return ranges
+
+
+# ---------------------------------------------------------------------------
+# Word sync extraction
+# ---------------------------------------------------------------------------
+
+def extract_words_for_sync(
+    transcript_data: dict, speed_factor: float = 0.75, time_offset: float = 0.3
+) -> list[dict]:
+    """Extract word timing data adjusted for slowed audio."""
+    try:
+        alt = (
+            transcript_data.get("results", {})
+            .get("channels", [{}])[0]
+            .get("alternatives", [{}])[0]
+        )
+        raw_words = alt.get("words", [])
+        if not raw_words:
+            return []
+
+        adj = 1.0 / speed_factor
+        result = []
+        for w in raw_words:
+            s = w.get("start", 0) * adj
+            e = w.get("end", 0) * adj
+            result.append(
+                {
+                    "text": w.get("punctuated_word", w.get("word", "")),
+                    "start": max(0, s - time_offset),
+                    "end": max(0.01, e - time_offset),
+                }
+            )
+        return result
+    except Exception as e:
+        print(f"Word sync error: {e}")
+        return []
+
+
+def extract_phrase_words_for_sync(
+    transcript_data: dict,
+    phrase_start_orig: float,
+    phrase_end_orig: float,
+    speed_factor: float = 0.75,
+    time_offset: float = 0.3,
+) -> list[dict]:
+    """Extract word timings for a specific phrase, relative to phrase start."""
+    try:
+        alt = (
+            transcript_data.get("results", {})
+            .get("channels", [{}])[0]
+            .get("alternatives", [{}])[0]
+        )
+        raw_words = alt.get("words", [])
+        if not raw_words:
+            return []
+
+        adj = 1.0 / speed_factor
+        result = []
+        for w in raw_words:
+            ws = w.get("start", 0)
+            we = w.get("end", 0)
+            if ws >= phrase_start_orig and we <= phrase_end_orig:
+                rs = (ws - phrase_start_orig) * adj
+                re_ = (we - phrase_start_orig) * adj
+                result.append(
+                    {
+                        "text": w.get("punctuated_word", w.get("word", "")),
+                        "start": max(0, rs - time_offset),
+                        "end": max(0.01, re_ - time_offset),
+                    }
+                )
+        return result
+    except Exception as e:
+        print(f"Phrase sync error: {e}")
+        return []
+
+
+# ---------------------------------------------------------------------------
+# Alignment (FIXED: sequential, no overlap)
+# ---------------------------------------------------------------------------
+
+def align_gpt_phrase_to_deepgram_words(
+    gpt_phrase_text: str,
+    deepgram_words: list[dict],
+    search_start_index: int = 0,
+    min_match_score: float = 70,
+) -> tuple[float, float, float, int]:
+    if not gpt_phrase_text or not deepgram_words:
+        return 0, 0, 0, search_start_index
+
+    norm_phrase = normalize_japanese(gpt_phrase_text)
+    if not norm_phrase:
+        return 0, 0, 0, search_start_index
+
+    search_words = deepgram_words[search_start_index:]
+    if not search_words:
+        last = deepgram_words[-1]
+        return last["start"], last["end"], 0, len(deepgram_words)
+
+    if FUZZY_MATCHING_AVAILABLE:
+        return _align_fuzzy(
+            norm_phrase, deepgram_words, search_start_index, min_match_score
+        )
+    else:
+        return _align_fallback(norm_phrase, deepgram_words, search_start_index)
+
+
+def _align_fuzzy(
+    normalized_phrase: str,
+    all_words: list[dict],
+    start_idx: int,
+    min_score: float,
+) -> tuple[float, float, float, int]:
+    best_score = 0
+    best_si = start_idx
+    best_ei = start_idx
+    n = len(all_words)
+
+    for window_size in range(1, n - start_idx + 1):
+        for si in range(start_idx, n - window_size + 1):
+            ei = si + window_size
+            window_words = all_words[si:ei]
+            window_text = "".join(
+                normalize_japanese(w.get("punctuated_word", w.get("word", "")))
+                for w in window_words
+            )
+            if not window_text:
+                continue
+
+            score = fuzz.ratio(normalized_phrase, window_text)
+            adj_score = score * (1 + 0.01 * len(window_text))
+
+            if adj_score > best_score:
+                best_score = adj_score
+                best_si = si
+                best_ei = ei - 1
+
+    if best_score >= min_score and best_ei < n:
+        return (
+            all_words[best_si]["start"],
+            all_words[best_ei]["end"],
+            best_score,
+            best_ei + 1,
+        )
+
+    return (
+        all_words[start_idx]["start"],
+        all_words[-1]["end"],
+        0,
+        len(all_words),
+    )
+
+
+def _align_fallback(
+    normalized_phrase: str,
+    all_words: list[dict],
+    start_idx: int,
+) -> tuple[float, float, float, int]:
+    search_words = all_words[start_idx:]
+    full_text = "".join(
+        normalize_japanese(w.get("punctuated_word", w.get("word", "")))
+        for w in search_words
+    )
+    if not full_text:
+        return 0, 0, 0, start_idx
+
+    pos = full_text.find(normalized_phrase)
+    if pos >= 0:
+        char_start = pos
+        char_end = pos + len(normalized_phrase) - 1
+        start_wi = None
+        end_wi = None
+        cp = 0
+        for i, w in enumerate(search_words):
+            wt = normalize_japanese(w.get("punctuated_word", w.get("word", "")))
+            ncp = cp + len(wt)
+            if start_wi is None and cp <= char_start < ncp:
+                start_wi = i
+            if cp <= char_end < ncp:
+                end_wi = i
+                break
+            cp = ncp
+        if start_wi is not None and end_wi is not None:
+            abs_si = start_idx + start_wi
+            abs_ei = start_idx + end_wi
+            return (
+                all_words[abs_si]["start"],
+                all_words[abs_ei]["end"],
+                100,
+                abs_ei + 1,
+            )
+
+    return (
+        all_words[start_idx]["start"],
+        all_words[-1]["end"],
+        0,
+        len(all_words),
+    )
+
+
+# ---------------------------------------------------------------------------
+# GPT / Claude analysis
+# ---------------------------------------------------------------------------
+
+ANALYSIS_PROMPT = """You are an expert Japanese language analyst and tutor for Korean learners. Analyze a Japanese segment by breaking it into grammatically meaningful phrases and explaining each one.
+
+Return ONLY a valid JSON object (no markdown fences, no extra text) with this structure:
+{
+  "phrases": [
+    {
+      "number": 1,
+      "text": "exact phrase text from input",
+      "words": [
+        {"japanese": "word", "kanji": "kanji or empty string", "romaji": "romaji", "meaning": "Korean meaning"}
+      ],
+      "kanji_explanations": [
+        {"kanji": "大", "reading": "だい", "meaning": "클 / 대"}
+      ],
+      "meaning": "Korean translation of phrase"
+    }
+  ]
+}
+
+CRITICAL SPLITTING RULES:
+- Short sentences (under ~25 chars): keep as ONE phrase. Do NOT split.
+  Example: "俺、今日ファーストキスしちゃうんだ。" → 1 phrase
+  Example: "すいません、生一つお願いします。" → 1 phrase
+  Example: "マキマさん、ここにどうぞ。" → 1 phrase
+- Medium sentences (25-50 chars): split into 2-3 phrases at natural clause boundaries.
+- Long sentences (50+ chars): split into 2-4 phrases at clause boundaries (て form, から, が, けど, etc.)
+- NEVER make a phrase with just 1-2 words unless it's a complete clause.
+- The "text" field MUST be the EXACT substring from the input segment, including any punctuation.
+
+Guidelines:
+1. Number each phrase sequentially (1, 2, 3...).
+2. For each word: japanese, kanji (empty string if none), romaji (Hepburn), meaning (Korean, concise).
+3. kanji_explanations: ONLY kanji in the current phrase. Include character, contextual reading, Korean meaning (e.g. "클 / 대" = Korean description + Hanja sound).
+4. Provide natural Korean translation of each phrase.
+
+Example for "ロシア大統領府によりますと":
+{
+  "phrases": [
+    {
+      "number": 1,
+      "text": "ロシア大統領府によりますと",
+      "words": [
+        {"japanese": "ロシア", "kanji": "", "romaji": "Roshia", "meaning": "러시아"},
+        {"japanese": "大統領府", "kanji": "大統領府", "romaji": "Daitōryōfu", "meaning": "대통령부"},
+        {"japanese": "に", "kanji": "", "romaji": "ni", "meaning": "~에"},
+        {"japanese": "よりますと", "kanji": "", "romaji": "yorimasu to", "meaning": "~의하면"}
+      ],
+      "kanji_explanations": [
+        {"kanji": "大", "reading": "だい", "meaning": "클 / 대"},
+        {"kanji": "統", "reading": "とう", "meaning": "거느릴 / 통"},
+        {"kanji": "領", "reading": "りょう", "meaning": "거느릴 / 령"},
+        {"kanji": "府", "reading": "ふ", "meaning": "마을 / 부"}
+      ],
+      "meaning": "러시아 대통령부에 의하면"
+    }
+  ]
+}
+
+Return ONLY the JSON object."""
+
+
+def create_fallback_json(segment_text: str) -> dict:
+    """Create fallback analysis when Claude fails."""
+    kanji_chars = [c for c in segment_text if 0x4E00 <= ord(c) <= 0x9FFF]
+    ke = [{"kanji": c, "reading": "", "meaning": "분석 실패"} for c in kanji_chars]
+    return {
+        "phrases": [
+            {
+                "number": 1,
+                "text": segment_text,
+                "words": [
+                    {
+                        "japanese": segment_text,
+                        "kanji": "".join(kanji_chars),
+                        "romaji": "",
+                        "meaning": "분석 실패",
+                    }
+                ],
+                "kanji_explanations": ke,
+                "meaning": segment_text,
+            }
+        ]
+    }
+
+
+def analyze_japanese_segment(
+    segment_text: str,
+    segment_start: float,
+    segment_end: float,
+    deepgram_words: list[dict],
+    previous_context: str = "",
+) -> dict:
+    """Analyze a Japanese segment using Claude Opus 4.6."""
+    client = get_claude_client()
+    if not client:
+        print("Claude client not available.")
+        return create_fallback_json(segment_text)
+
+    max_tokens = min(4096, max(1024, len(segment_text) * 50))
+    max_retries = 2
+    retry_delay = 3
+
+    user_msg = ANALYSIS_PROMPT + "\n\n"
+    if previous_context:
+        user_msg += f"Previous context (for reference only, do NOT analyze this): {previous_context}\n\n"
+    user_msg += f"Analyze this Japanese segment: {segment_text}"
+
+    for attempt in range(max_retries):
+        try:
+            message = client.messages.create(
+                model="claude-opus-4-6",
+                max_tokens=4096,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": user_msg,
+                    }
+                ],
+            )
+
+            response_text = _strip_json_fences(message.content[0].text)
+            analysis = json.loads(response_text)
+
+            if "phrases" in analysis and deepgram_words:
+                last_word_index = 0
+                for p in analysis["phrases"]:
+                    s, e, score, new_idx = align_gpt_phrase_to_deepgram_words(
+                        p.get("text", ""),
+                        deepgram_words,
+                        search_start_index=last_word_index,
+                    )
+                    p["original_start_time"] = s
+                    p["original_end_time"] = e
+                    p["match_score"] = score
+                    last_word_index = new_idx
+            elif "phrases" in analysis:
+                n = len(analysis["phrases"])
+                duration = segment_end - segment_start
+                for i, p in enumerate(analysis["phrases"]):
+                    p["original_start_time"] = segment_start + duration * (i / n)
+                    p["original_end_time"] = segment_start + duration * ((i + 1) / n)
+                    p["match_score"] = 0
+
+            return analysis
+
+        except json.JSONDecodeError as e:
+            print(f"Claude JSON parse error (attempt {attempt + 1}): {e}")
+            time.sleep(retry_delay * (attempt + 1))
+        except Exception as e:
+            print(f"Claude analysis error (attempt {attempt + 1}): {e}")
+            time.sleep(retry_delay * (attempt + 1))
+
+    return create_fallback_json(segment_text)
+
+
+# ---------------------------------------------------------------------------
+# Vocabulary collection
+# ---------------------------------------------------------------------------
+
+def collect_vocab_with_kanji(
+    gpt_json: dict,
+    vocab_map: dict,
+    phrase_sync_words: list[dict] | None = None,
+    speed_factor: float = 0.75,
+    time_offset: float = 0.3,
+):
+    """Collect kanji words from GPT analysis with real timings."""
+    if not gpt_json or "phrases" not in gpt_json:
+        return
+
+    for phr in gpt_json["phrases"]:
+        lookup = {}
+        if phrase_sync_words:
+            adj = 1.0 / speed_factor
+            off = (phr.get("original_start_time", 0) or 0) * adj - time_offset
+            toks = phrase_sync_words
+            n = len(toks)
+
+            for t in toks:
+                lookup[norm_for_alignment(t["text"])] = (
+                    t["start"] + off,
+                    t["end"] + off,
+                )
+
+            for span in range(2, min(9, n + 1)):
+                for i in range(n - span + 1):
+                    win = toks[i : i + span]
+                    key = norm_for_alignment("".join(t["text"] for t in win))
+                    lookup[key] = (win[0]["start"] + off, win[-1]["end"] + off)
+
+        lkeys = list(lookup.keys())
+
+        for w in phr["words"]:
+            if not w.get("kanji"):
+                continue
+            surf = w.get("japanese", "")
+            if not surf:
+                continue
+
+            k = norm_for_alignment(surf)
+            start = end = None
+
+            if k in lookup:
+                start, end = lookup[k]
+            elif FUZZY_MATCHING_AVAILABLE and lkeys:
+                hit, score, _ = process.extractOne(k, lkeys, scorer=fuzz.ratio)
+                if score >= 90:
+                    start, end = lookup[hit]
+
+            if start is not None and (end - start) < 0.15:
+                start = end = None
+
+            if surf not in vocab_map or (
+                start is not None and vocab_map[surf].get("start") is None
+            ):
+                vocab_map[surf] = {
+                    "kanji": w.get("kanji", ""),
+                    "romaji": w.get("romaji", ""),
+                    "meaning": w.get("meaning", ""),
+                    "kanji_readings": {
+                        ke["kanji"]: ke["reading"]
+                        for ke in phr.get("kanji_explanations", [])
+                        if ke.get("kanji") and ke.get("reading")
+                    },
+                    "start": start,
+                    "end": end,
+                }
+===./lib/database.py===
+# lib/database.py
+"""Single canonical database module.
+
+All DB access goes through this module.
+Uses a single connection per call-site, passed through the pipeline.
+"""
+
+import sqlite3
+import json
+from pathlib import Path
+from config import DB_PATH
+
+
+def get_db_connection() -> sqlite3.Connection:
+    """Get a database connection with WAL mode and foreign keys enabled."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA foreign_keys=ON;")
+    return conn
+
+
+# ---------------------------------------------------------------------------
+# Video CRUD
+# ---------------------------------------------------------------------------
+
+def get_all_videos(conn: sqlite3.Connection):
+    return conn.execute(
+        "SELECT id, youtube_url, video_title, video_data_directory, created_at "
+        "FROM Videos ORDER BY created_at DESC"
+    ).fetchall()
+
+
+def get_video_by_url(conn: sqlite3.Connection, url: str):
+    return conn.execute(
+        "SELECT id, video_title, video_data_directory FROM Videos WHERE youtube_url = ?",
+        (url,),
+    ).fetchone()
+
+
+def get_video_by_id(conn: sqlite3.Connection, video_id: int):
+    return conn.execute("SELECT * FROM Videos WHERE id = ?", (video_id,)).fetchone()
+
+
+def insert_video(conn: sqlite3.Connection, url: str, title: str) -> int:
+    cursor = conn.execute(
+        "INSERT INTO Videos (youtube_url, video_title) VALUES (?, ?)", (url, title)
+    )
+    conn.commit()
+    return cursor.lastrowid
+
+
+def update_video_directory(conn: sqlite3.Connection, video_id: int, dir_name: str):
+    conn.execute(
+        "UPDATE Videos SET video_data_directory = ? WHERE id = ?",
+        (dir_name, video_id),
+    )
+
+
+def update_video_audio(conn: sqlite3.Connection, video_id: int, audio_filename: str):
+    conn.execute(
+        "UPDATE Videos SET full_slowed_audio_path = ? WHERE id = ?",
+        (audio_filename, video_id),
+    )
+
+
+def update_video_transcript(
+    conn: sqlite3.Connection,
+    video_id: int,
+    raw_json_str: str,
+    full_text: str,
+    sync_words_json: str,
+):
+    conn.execute(
+        "UPDATE Videos SET raw_deepgram_response_json=?, full_transcript_text=?, "
+        "full_words_for_sync_json=? WHERE id=?",
+        (raw_json_str, full_text, sync_words_json, video_id),
+    )
+
+
+def delete_video(conn: sqlite3.Connection, video_id: int):
+    """Delete video and all cascading data."""
+    conn.execute("DELETE FROM Videos WHERE id = ?", (video_id,))
+    conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Segment CRUD
+# ---------------------------------------------------------------------------
+
+def insert_segment(
+    conn: sqlite3.Connection,
+    video_id: int,
+    seg_idx: int,
+    text: str,
+    start: float,
+    end: float,
+    words_json: str,
+) -> int:
+    cursor = conn.execute(
+        "INSERT INTO Segments (video_id, segment_index, text, start_time, end_time, "
+        "deepgram_segment_words_json) VALUES (?,?,?,?,?,?)",
+        (video_id, seg_idx, text, start, end, words_json),
+    )
+    return cursor.lastrowid
+
+
+def get_segments_for_video(conn: sqlite3.Connection, video_id: int):
+    return conn.execute(
+        "SELECT * FROM Segments WHERE video_id = ? ORDER BY segment_index",
+        (video_id,),
+    ).fetchall()
+
+
+# ---------------------------------------------------------------------------
+# Phrase Analysis CRUD
+# ---------------------------------------------------------------------------
+
+def insert_phrase_analysis(
+    conn: sqlite3.Connection,
+    segment_id: int,
+    phrase_idx: int,
+    gpt_json_str: str,
+    audio_path: str | None,
+    sync_words_json: str,
+):
+    conn.execute(
+        "INSERT INTO GptPhraseAnalyses "
+        "(segment_id, phrase_index_in_segment, gpt_phrase_json, "
+        "phrase_slowed_audio_path, phrase_words_for_sync_json) "
+        "VALUES (?,?,?,?,?)",
+        (segment_id, phrase_idx, gpt_json_str, audio_path, sync_words_json),
+    )
+
+
+def get_phrase_analyses_for_segment(conn: sqlite3.Connection, segment_id: int):
+    return conn.execute(
+        "SELECT * FROM GptPhraseAnalyses WHERE segment_id = ? "
+        "ORDER BY phrase_index_in_segment",
+        (segment_id,),
+    ).fetchall()
+
+
+def get_all_phrase_analyses_for_video(conn: sqlite3.Connection, video_id: int):
+    return conn.execute(
+        "SELECT gpa.gpt_phrase_json, gpa.phrase_words_for_sync_json "
+        "FROM GptPhraseAnalyses gpa "
+        "JOIN Segments s ON gpa.segment_id = s.id "
+        "WHERE s.video_id = ?",
+        (video_id,),
+    ).fetchall()
+
+
+# ---------------------------------------------------------------------------
+# Kanji CRUD
+# ---------------------------------------------------------------------------
+
+def insert_kanji_entry(
+    conn: sqlite3.Connection, video_id: int, char: str, reading: str, meaning: str
+):
+    try:
+        conn.execute(
+            "INSERT INTO KanjiEntries (video_id, character, reading, meaning) "
+            "VALUES (?,?,?,?)",
+            (video_id, char, reading, meaning),
+        )
+    except sqlite3.IntegrityError:
+        pass  # Already exists
+
+
+def get_kanji_for_video(conn: sqlite3.Connection, video_id: int):
+    return conn.execute(
+        "SELECT character, reading, meaning FROM KanjiEntries WHERE video_id = ?",
+        (video_id,),
+    ).fetchall()
+
+
+def extract_and_store_kanji(conn: sqlite3.Connection, video_id: int):
+    """Extract unique kanji from all phrase analyses and store in KanjiEntries."""
+    rows = get_all_phrase_analyses_for_video(conn, video_id)
+    unique_kanji = {}
+    for row in rows:
+        gd = json.loads(row["gpt_phrase_json"])
+        for ke in gd.get("kanji_explanations", []):
+            char = ke.get("kanji")
+            if char and char not in unique_kanji:
+                unique_kanji[char] = {
+                    "reading": ke.get("reading", ""),
+                    "meaning": ke.get("meaning", ""),
+                }
+    for char, info in unique_kanji.items():
+        insert_kanji_entry(conn, video_id, char, info["reading"], info["meaning"])
+    conn.commit()
+
+
+def load_kanji_first_occurrences(conn: sqlite3.Connection, video_id: int) -> dict:
+    """Return {kanji_char: (first_start_time, sequence_index)}."""
+    earliest = {}
+    seq = 0
+    rows = get_all_phrase_analyses_for_video(conn, video_id)
+    for row in rows:
+        phr = json.loads(row["gpt_phrase_json"])
+        t0 = phr.get("original_start_time") or float("inf")
+        for ke in phr.get("kanji_explanations", []):
+            k = ke.get("kanji")
+            if k and k not in earliest:
+                earliest[k] = (t0, seq)
+                seq += 1
+    return earliest
+
+
+# ---------------------------------------------------------------------------
+# Batch operations
+# ---------------------------------------------------------------------------
+
+def batch_insert_phrase_analyses(
+    conn: sqlite3.Connection,
+    rows: list[tuple],
+):
+    """Insert multiple phrase analyses in one executemany call.
+
+    Each tuple: (segment_id, phrase_idx, gpt_json_str, audio_path, sync_json)
+    """
+    conn.executemany(
+        "INSERT INTO GptPhraseAnalyses "
+        "(segment_id, phrase_index_in_segment, gpt_phrase_json, "
+        "phrase_slowed_audio_path, phrase_words_for_sync_json) "
+        "VALUES (?,?,?,?,?)",
+        rows,
+    )
+
+===./lib/__init__.py===
+
+===./lib/utils.py===
+# lib/utils.py
+"""Shared utility functions with memoization."""
+
+import re
+from functools import lru_cache
+
+
+@lru_cache(maxsize=4096)
+def normalize_japanese(text: str) -> str:
+    """Remove brackets, spaces, normalize Japanese text. Memoized."""
+    if not text:
+        return ""
+    return re.sub(r'[「」『』（）\(\)\s\u3000]', '', text).strip()
+
+
+# Full-width to half-width digit translation table
+_FULL2HALF = str.maketrans("０１２３４５６７８９", "0123456789")
+
+
+@lru_cache(maxsize=4096)
+def norm_for_alignment(text: str) -> str:
+    """Normalize text for alignment: remove brackets, spaces, convert digits."""
+    return normalize_japanese(text).translate(_FULL2HALF)
+
+===./lib/players.py===
+# lib/players.py
+"""HTML/JS player components with base64 audio."""
+
+import json
+import os
+import time
+import base64
+import streamlit as st
+from config import AUDIO_FILES_STORAGE_ROOT_ABS_PATH
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_audio_base64(filepath: str) -> str:
+    """Read file, return base64 string. Cached so it doesn't re-encode on every rerun."""
+    if not filepath or not os.path.exists(filepath):
+        return ""
+    with open(filepath, "rb") as f:
+        return base64.b64encode(f.read()).decode()
+
+
+def _full_path(video_dir_name, filename):
+    return str(AUDIO_FILES_STORAGE_ROOT_ABS_PATH / video_dir_name / filename)
+
+
+def _phrase_path(video_dir_name, filename):
+    return str(AUDIO_FILES_STORAGE_ROOT_ABS_PATH / video_dir_name / "phrases" / filename)
+
+
+# ---------------------------------------------------------------------------
+# Main transcript player
+# ---------------------------------------------------------------------------
+
+def create_synchronized_player(
+    video_dir_name: str,
+    audio_filename: str,
+    words_for_sync: list[dict],
+    height: int = 700,
+):
+    if not audio_filename or not video_dir_name:
+        st.warning("Audio file information missing.")
+        return
+
+    b64 = load_audio_base64(_full_path(video_dir_name, audio_filename))
+    if not b64:
+        st.warning("Audio file not found.")
+        return
+
+    words_json = json.dumps(words_for_sync or [])
+    pid = f"main-{int(time.time() * 1000)}"
+
+    html = f"""
+    <div style="width:100%;font-family:sans-serif;">
+        <audio id="audio-{pid}" controls style="width:100%;" preload="metadata">
+            <source src="data:audio/mp3;base64,{b64}" type="audio/mp3">
+        </audio>
+        <div id="text-{pid}"
+             style="margin-top:10px;font-size:18px;line-height:1.8;
+                    max-height:{height-100}px;overflow-y:auto;padding:5px;">
+        </div>
+    </div>
+    <script>
+    (function(){{
+        "use strict";
+        const words={words_json};
+        const audio=document.getElementById('audio-{pid}');
+        const display=document.getElementById('text-{pid}');
+        if(!audio||!display)return;
+        if(!words||!words.length){{display.innerHTML='<p style="color:grey;text-align:center;">No transcript data.</p>';return;}}
+
+        function buildPhrases(){{
+            const phrases=[];let cur=[];let lastEnd=0;
+            words.forEach((w,i)=>{{
+                const connected=i>0&&Math.abs(w.start-lastEnd)<0.3;
+                const punct=['。','、','！','？'].some(p=>w.text.includes(p));
+                cur.push(w);lastEnd=w.end;
+                if(punct||(!connected&&cur.length>0)){{
+                    if(cur.length>0){{phrases.push([...cur]);cur=[];}}
+                }}
+            }});
+            if(cur.length>0)phrases.push(cur);
+            const merged=[];
+            for(let i=0;i<phrases.length;i++){{
+                const txt=phrases[i].map(w=>w.text).join('');
+                if(txt.length<=3&&i<phrases.length-1){{
+                    phrases[i+1]=[...phrases[i],...phrases[i+1]];
+                }}else{{merged.push(phrases[i]);}}
+            }}
+            return merged;
+        }}
+
+        const PHRASES=buildPhrases();
+        const flatWords=[];
+        PHRASES.forEach(ph=>ph.forEach(w=>flatWords.push(w)));
+
+        function render(){{
+            display.innerHTML='';let idx=0;
+            PHRASES.forEach(ph=>{{
+                const div=document.createElement('div');
+                div.style.marginBottom='10px';
+                ph.forEach(w=>{{
+                    const span=document.createElement('span');
+                    span.textContent=w.text;
+                    span.id='w-{pid}-'+idx;idx++;
+                    span.style.cursor='pointer';
+                    span.style.transition='color 0.2s,font-weight 0.2s';
+                    span.onclick=()=>{{if(!audio.paused){{audio.pause();}}else{{audio.currentTime=w.start;audio.play().catch(()=>{{}});}}}};
+                    div.appendChild(span);
+                }});
+                display.appendChild(div);
+            }});
+        }}
+
+        function highlight(){{
+            const t=audio.currentTime;let active=null;
+            for(let i=0;i<flatWords.length;i++){{
+                const el=document.getElementById('w-{pid}-'+i);
+                if(!el)continue;
+                if(t>=flatWords[i].start&&t<flatWords[i].end){{
+                    el.style.color='#ff4b4b';el.style.fontWeight='bold';active=el;
+                }}else{{el.style.color='';el.style.fontWeight='';}}
+            }}
+            if(active&&display.contains(active)){{
+                const dr=display.getBoundingClientRect();
+                const wr=active.getBoundingClientRect();
+                if(wr.top<dr.top+30||wr.bottom>dr.bottom-30){{
+                    display.scrollTop+=(wr.top-dr.top)-(dr.height/2)+(wr.height/2);
+                }}
+            }}
+        }}
+
+        render();
+        audio.addEventListener('timeupdate',highlight);
+    }})();
+    </script>
+    """
+    st.components.v1.html(html, height=height)
+
+
+# ---------------------------------------------------------------------------
+# Phrase player
+# ---------------------------------------------------------------------------
+
+def create_phrase_player_html(
+    video_dir_name: str,
+    phrase_audio_filename: str | None,
+    phrase_words: list[dict],
+    phrase_unique_id: str,
+    kanji_map: dict,
+) -> str:
+    words_json = json.dumps(phrase_words or [])
+    kanji_json = json.dumps(kanji_map, ensure_ascii=False)
+
+    aid = f"audio-phr-{phrase_unique_id}"
+    tid = f"text-phr-{phrase_unique_id}"
+
+    audio_tag = ""
+    if phrase_audio_filename and video_dir_name:
+        b64 = load_audio_base64(_phrase_path(video_dir_name, phrase_audio_filename))
+        if b64:
+            audio_tag = f'<audio id="{aid}" loop preload="none"><source src="data:audio/mp3;base64,{b64}" type="audio/mp3"></audio>'
+
+    return f"""
+    <div class="phrase-player">
+        {audio_tag}
+        <div id="{tid}"
+             style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+                    font-size:30px;line-height:1.8;padding:5px 10px;cursor:pointer;">
+        </div>
+    </div>
+    <script>
+    (function(){{
+        "use strict";
+        if(!window.parent.__pam){{window.parent.__pam={{cur:null,clearFn:null,stopCur(){{
+            if(this.cur)try{{this.cur.pause();}}catch(_){{}}
+            if(this.clearFn)this.clearFn();this.cur=null;this.clearFn=null;
+        }}}};}}
+
+        const W={words_json};
+        const KM=JSON.parse('{kanji_json.replace(chr(39), chr(92)+chr(39))}');
+        const aud=document.getElementById('{aid}');
+        const txt=document.getElementById('{tid}');
+        if(!txt)return;
+        if(!W||!W.length)return;
+
+        function clearHL(){{
+            W.forEach((_,i)=>{{
+                const el=document.getElementById('wp-{phrase_unique_id}-'+i);
+                if(el){{el.style.color='';el.style.fontWeight='';}}
+            }});
+        }}
+
+        function furigana(text,map){{
+            let h='';
+            for(let i=0;i<text.length;i++){{
+                const c=text[i];const cc=c.charCodeAt(0);
+                const isK=(cc>=0x4E00&&cc<=0x9FFF)||(cc>=0x3400&&cc<=0x4DBF)||(cc>=0xF900&&cc<=0xFAFF);
+                if(isK&&map&&map[c])h+='<ruby><rb>'+c+'</rb><rt>'+map[c]+'</rt></ruby>';
+                else h+=c;
+            }}
+            return h;
+        }}
+
+        function render(){{
+            txt.innerHTML='';const div=document.createElement('div');
+            W.forEach((w,i)=>{{
+                const span=document.createElement('span');
+                span.innerHTML=furigana(w.text,KM);
+                span.id='wp-{phrase_unique_id}-'+i;
+                span.style.cursor='pointer';span.style.transition='color 0.2s,font-weight 0.2s';
+                span.style.marginRight='2px';
+                span.onclick=()=>{{
+                    if(!aud)return;
+                    if(!aud.paused&&window.parent.__pam.cur===aud){{aud.pause();}}
+                    else{{
+                        window.parent.__pam.stopCur();
+                        window.parent.__pam.cur=aud;window.parent.__pam.clearFn=clearHL;
+                        aud.currentTime=w.start;aud.play().catch(()=>{{}});
+                    }}
+                }};
+                div.appendChild(span);
+            }});
+            txt.appendChild(div);
+        }}
+
+        function highlight(){{
+            if(!aud)return;const t=aud.currentTime;
+            W.forEach((w,i)=>{{
+                const el=document.getElementById('wp-{phrase_unique_id}-'+i);
+                if(!el)return;
+                if(t>=w.start&&t<w.end){{el.style.color='#ff4b4b';el.style.fontWeight='bold';}}
+                else{{el.style.color='';el.style.fontWeight='';}}
+            }});
+        }}
+
+        render();
+        if(aud)aud.addEventListener('timeupdate',highlight);
+    }})();
+    </script>
+    """
+
+
+# ---------------------------------------------------------------------------
+# Breakdown HTML for a segment
+# ---------------------------------------------------------------------------
+
+def generate_breakdown_html(
+    phrases_data: list[dict],
+    phrase_audio_map: dict[int, str | None],
+    phrase_sync_words_map: dict[int, list[dict]],
+    video_dir_name: str,
+    segment_id: int,
+) -> str:
+    parts = []
+    for i, phrase in enumerate(phrases_data):
+        kanji_map = {
+            k["kanji"]: k["reading"]
+            for k in phrase.get("kanji_explanations", [])
+            if k.get("kanji") and k.get("reading")
+        }
+        uid = f"S{segment_id}_P{i}"
+
+        parts.append(create_phrase_player_html(
+            video_dir_name, phrase_audio_map.get(i), phrase_sync_words_map.get(i, []), uid, kanji_map
+        ))
+
+        font = '-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif'
+
+        # Korean meaning right below the Japanese phrase
+        if phrase.get("meaning"):
+            parts.append(
+                f"<div style='margin-top:0;margin-bottom:12px;font-family:{font};'>"
+                f"<p style='font-size:20px;line-height:1.6;margin:0;color:#555;'>{phrase['meaning']}</p></div>"
+            )
+
+        # Build a lookup: for each word, find its kanji explanations (meaning only, no reading)
+        kanji_explanations = phrase.get("kanji_explanations", [])
+        ke_lookup = {}
+        for ke in kanji_explanations:
+            ch = ke.get("kanji", "")
+            meaning = ke.get("meaning", "")
+            if ch:
+                ke_lookup[ch] = meaning
+
+        # Check if ANY word in the phrase has kanji
+        has_any_kanji = any(w.get("kanji") for w in phrase.get("words", []))
+
+        th_style = "border:1px solid #e0e0e0;padding:8px 12px;text-align:left;background-color:#f2f2f2;font-size:15px;"
+        td_style = "border:1px solid #e0e0e0;padding:8px 12px;text-align:left;font-size:15px;"
+
+        table = f"<table style='width:100%;border-collapse:collapse;margin-bottom:15px;font-family:{font};'>"
+        table += "<tr>"
+        table += f"<th style='{th_style}'>일본어</th>"
+        table += f"<th style='{th_style}'>로마자</th>"
+        table += f"<th style='{th_style}'>품사/설명</th>"
+        if has_any_kanji:
+            table += f"<th style='{th_style}'>한자</th>"
+        table += "</tr>"
+
+        for w in phrase.get("words", []):
+            table += "<tr>"
+            table += f"<td style='{td_style}'>{w.get('japanese', '')}</td>"
+            table += f"<td style='{td_style}'>{w.get('romaji', '')}</td>"
+            table += f"<td style='{td_style}'>{w.get('meaning', '')}</td>"
+            if has_any_kanji:
+                # Build kanji cell: only actual kanji characters (filter out hiragana/katakana)
+                kanji_str = w.get("kanji", "")
+                if kanji_str:
+                    kanji_parts = []
+                    for ch in kanji_str:
+                        cp = ord(ch)
+                        is_kanji = (0x4E00 <= cp <= 0x9FFF) or (0x3400 <= cp <= 0x4DBF) or (0xF900 <= cp <= 0xFAFF)
+                        if not is_kanji:
+                            continue
+                        m = ke_lookup.get(ch, "")
+                        if m:
+                            kanji_parts.append(f"<strong>{ch}</strong> <span style='color:#666;font-size:13px;'>{m}</span>")
+                        else:
+                            kanji_parts.append(f"<strong>{ch}</strong>")
+                    if kanji_parts:
+                        table += f"<td style='{td_style}'>{'<br>'.join(kanji_parts)}</td>"
+                    else:
+                        table += f"<td style='{td_style}'></td>"
+                else:
+                    table += f"<td style='{td_style}'></td>"
+            table += "</tr>"
+
+        table += "</table>"
+        parts.append(table)
+
+        if i < len(phrases_data) - 1:
+            parts.append("<hr style='margin-top:15px;margin-bottom:15px;border:0;height:1px;background-color:#e0e0e0;'>")
+
+    # Auto-resize via Streamlit's postMessage API
+    parts.append("""
+    <script>
+    (function(){
+        function sendHeight(){
+            var h=document.documentElement.scrollHeight;
+            if(h>10){
+                window.parent.postMessage({type:"streamlit:setFrameHeight",height:h},"*");
+            }
+        }
+        sendHeight();
+        setTimeout(sendHeight,100);
+        setTimeout(sendHeight,300);
+    })();
+    </script>
+    """)
+
+    return "".join(parts)
+
+
+def estimate_segment_height(phrases: list[dict]) -> int:
+    """Height estimate per segment - slightly generous to avoid clipping."""
+    total = 30
+    for p in phrases:
+        # phrase text ~60px + meaning ~40px + table header ~42px + margin/padding ~30px
+        total += 60 + 40 + 42 + 30
+        word_rows = max(1, len(p.get("words", [])))
+        total += word_rows * 40
+        # hr between phrases
+        total += 20
+    return max(200, total)
+
+
+# ---------------------------------------------------------------------------
+# Vocabulary component
+# ---------------------------------------------------------------------------
+
+def create_vocab_component(
+    vocab_map: dict,
+    video_dir_name: str,
+    audio_filename: str | None,
+) -> str:
+    sorted_items = sorted(vocab_map.items(), key=lambda kv: float("inf") if kv[1]["start"] is None else kv[1]["start"])
+
+    # Same file as transcript player → cache hit, no re-encode
+    audio_b64 = ""
+    if audio_filename and video_dir_name:
+        audio_b64 = load_audio_base64(_full_path(video_dir_name, audio_filename))
+
+    html = """
+    <style>
+    .vocab-card{border:1px solid #e0e0e0;border-radius:8px;padding:20px;margin-bottom:12px;
+        background:#fff;box-shadow:0 2px 4px rgba(0,0,0,0.05);
+        transition:box-shadow 0.2s,transform 0.2s;text-align:center;cursor:pointer;position:relative;}
+    .vocab-card:hover{box-shadow:0 4px 8px rgba(0,0,0,0.1);transform:translateY(-2px);}
+    .vocab-card.playing{background:#f8f8ff;border-color:#4285f4;box-shadow:0 4px 12px rgba(66,133,244,0.2);}
+    .vocab-jp{font-size:2.2rem;margin-bottom:16px;color:#2c3e50;font-weight:500;line-height:1.4;}
+    .vocab-mean{font-size:1.4rem;color:#16a085;font-weight:500;}
+    .vocab-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:15px;padding:10px;}
+    rt{font-size:0.7em;color:#555;opacity:0.9;}
+    .no-timing{border:1px dashed #ff9800!important;}
+    </style>
+    """
+
+    if audio_b64:
+        html += f'<audio id="vocab-aud" preload="metadata"><source src="data:audio/mp3;base64,{audio_b64}" type="audio/mp3"></audio>'
+    else:
+        html += '<audio id="vocab-aud"></audio>'
+
+    html += """
+    <div class="vocab-grid">
+    """
+
+    for jp, info in sorted_items:
+        jp_display = jp
+        for kanji, reading in info.get("kanji_readings", {}).items():
+            if kanji in jp_display:
+                jp_display = jp_display.replace(kanji, f"<ruby>{kanji}<rt>{reading}</rt></ruby>")
+
+        start, end = info.get("start"), info.get("end")
+        has_timing = start is not None and end is not None
+        s_attr = f'data-start="{start}"' if has_timing else ""
+        e_attr = f'data-end="{end}"' if has_timing else ""
+        cls = "" if has_timing else "no-timing"
+
+        html += f"""
+        <div class="vocab-card {cls}" {s_attr} {e_attr} onclick="playVocab(this)">
+            <div class="vocab-jp">{jp_display}</div>
+            <div class="vocab-mean">{info['meaning']}</div>
+        </div>
+        """
+
+    html += "</div>"
+
+    html += """
+    <script>
+    (function(){
+        const player=document.getElementById('vocab-aud');
+        let curCard=null;let endBound=null;
+
+        if(player){
+            player.addEventListener('timeupdate',function(){
+                if(endBound!==null&&player.currentTime>=endBound){
+                    player.pause();
+                    if(curCard){curCard.classList.remove('playing');curCard=null;}
+                    endBound=null;
+                }
+            });
+        }
+
+        window.playVocab=function(card){
+            if(!player)return;
+            const s=parseFloat(card.dataset.start);
+            const e=parseFloat(card.dataset.end);
+            if(isNaN(s)||isNaN(e)){card.style.border='2px solid orange';setTimeout(()=>{card.style.border='';},2000);return;}
+            if(curCard){curCard.classList.remove('playing');}
+            card.classList.add('playing');curCard=card;
+            const EXTRA=0.8;
+            endBound=Math.min(player.duration||e+EXTRA+1,e+EXTRA);
+            player.currentTime=s+0.3;
+            player.play().catch(()=>{card.classList.remove('playing');});
+        };
+    })();
+    </script>
+    """
+
+    return html
+===./lib/audio.py===
+# lib/audio.py
+"""Audio processing: download, speed change, phrase clip extraction."""
+
+import os
+import shutil
+from pathlib import Path
+from pydub import AudioSegment
+
+
+def download_audio(url: str, output_dir: Path) -> tuple[str | None, str | None]:
+    """Download audio from YouTube URL. Returns (filepath, title) or (None, None)."""
+    import yt_dlp
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    ydl_opts = {
+        "format": "bestaudio/best",
+        "postprocessors": [
+            {
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": "192",
+            }
+        ],
+        "outtmpl": str(output_dir / "%(title)s.%(ext)s"),
+        "verbose": False,
+        "noplaylist": True,
+        "nocheckcertificate": True,
+        "retries": 10,
+        "fragment_retries": 10,
+    }
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            title = info.get("title", "video")
+            mp3_files = list(output_dir.glob("*.mp3"))
+            if not mp3_files:
+                return None, None
+            filepath = max(mp3_files, key=os.path.getctime)
+            return str(filepath), title
+    except Exception as e:
+        print(f"Download error: {e}")
+        return None, None
+
+
+def slow_down_audio(
+    input_path: str, output_path: str, speed_factor: float = 0.75
+) -> str | None:
+    """Slow down audio using ffmpeg atempo filter.
+
+    Handles speed factors below 0.5 by chaining atempo filters.
+    Returns output path on success, None on failure.
+    """
+    try:
+        inp = Path(input_path)
+        out = Path(output_path)
+        out.parent.mkdir(parents=True, exist_ok=True)
+
+        # Build atempo filter chain for factors < 0.5
+        # atempo only supports 0.5-2.0, so chain multiple filters
+        filters = []
+        remaining = speed_factor
+        while remaining < 0.5:
+            filters.append("atempo=0.5")
+            remaining /= 0.5
+        filters.append(f"atempo={remaining}")
+        filter_str = ",".join(filters)
+
+        audio = AudioSegment.from_file(str(inp))
+        temp_path = out.parent / f"_temp_{out.name}"
+        audio.export(
+            str(temp_path), format="mp3", parameters=["-filter:a", filter_str]
+        )
+        os.rename(str(temp_path), str(out))
+        return str(out)
+    except Exception as e:
+        print(f"Slow down error: {e}")
+        # Fallback: copy original
+        if os.path.exists(input_path):
+            shutil.copy(input_path, output_path)
+            return output_path
+        return None
+
+
+def create_phrase_audio_clips(
+    original_audio_path: str,
+    phrases_with_timings: list[tuple[float, float]],
+    output_dir: Path,
+    speed_factor: float,
+    segment_id: int,
+) -> dict[int, str | None]:
+    """Extract and slow down audio clips for each phrase.
+
+    Args:
+        original_audio_path: Path to the original (non-slowed) full audio
+        phrases_with_timings: List of (start_sec, end_sec) for each phrase
+        output_dir: Directory to save phrase clips
+        speed_factor: Speed factor for slowing
+        segment_id: Used for naming files
+
+    Returns:
+        Dict mapping phrase_index -> filename (or None if failed)
+    """
+    result = {}
+    if not os.path.exists(original_audio_path):
+        return result
+
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        main_audio = AudioSegment.from_mp3(original_audio_path)
+
+        for i, (start_s, end_s) in enumerate(phrases_with_timings):
+            start_ms = int(start_s * 1000)
+            end_ms = int(end_s * 1000)
+
+            # Reduced padding: 50ms instead of 150ms to avoid overlap
+            start_ms = max(0, start_ms - 50)
+            end_ms = min(len(main_audio), end_ms + 50)
+
+            if start_ms >= end_ms:
+                result[i] = None
+                continue
+
+            clip = main_audio[start_ms:end_ms]
+            temp_fn = f"_temp_S{segment_id}_P{i}.mp3"
+            temp_fp = output_dir / temp_fn
+            clip.export(str(temp_fp), format="mp3")
+
+            final_fn = f"phrase_S{segment_id}_P{i}.mp3"
+            final_fp = output_dir / final_fn
+            slowed = slow_down_audio(str(temp_fp), str(final_fp), speed_factor)
+
+            result[i] = final_fn if slowed else None
+
+            # Clean up temp
+            try:
+                os.remove(str(temp_fp))
+            except OSError:
+                pass
+
+        return result
+    except Exception as e:
+        print(f"Phrase audio error S{segment_id}: {e}")
+        return {i: None for i in range(len(phrases_with_timings))}
+
+===./db_utils.py===
+# db_utils.py
+import sqlite3
+import json
+import os
+from config import DATABASE_PATH # Import the DATABASE_PATH
+
+def get_db_connection():
+    """Establishes a connection to the SQLite database."""
+    conn = sqlite3.connect(DATABASE_PATH)
+    conn.row_factory = sqlite3.Row # Access columns by name
+    return conn
+
+def init_db():
+    """Initializes the database and creates tables if they don't exist."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    # Enable Foreign Key support
+    cursor.execute("PRAGMA foreign_keys = ON;")
+
+    # Videos Table
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS Videos (
+        video_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        youtube_url TEXT UNIQUE NOT NULL,
+        video_title TEXT,
+        download_timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+        original_audio_path TEXT, -- Relative to AUDIO_DATA_ROOT_PATH
+        slowed_audio_path TEXT,   -- Relative to AUDIO_DATA_ROOT_PATH
+        deepgram_transcript_json TEXT,
+        full_plain_transcript TEXT,
+        processing_status TEXT DEFAULT 'pending' -- e.g., pending, transcribed, analyzed, complete, error
+    );
+    """)
+
+    # TranscriptSegments Table
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS TranscriptSegments (
+        segment_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        video_id INTEGER NOT NULL,
+        segment_index INTEGER NOT NULL, -- 0-based index within the video
+        text_content TEXT,
+        start_time_original REAL, -- From original Deepgram transcript
+        end_time_original REAL,   -- From original Deepgram transcript
+        words_json TEXT,          -- JSON of Deepgram words for this segment
+        gpt_analysis_json TEXT,   -- Full GPT JSON for this segment
+        -- slowed_segment_audio_path TEXT, -- Decided to focus on phrase players, can add if needed
+        FOREIGN KEY (video_id) REFERENCES Videos (video_id) ON DELETE CASCADE,
+        UNIQUE (video_id, segment_index)
+    );
+    """)
+
+    # AnalyzedPhrases Table
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS AnalyzedPhrases (
+        phrase_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        segment_id INTEGER NOT NULL,
+        phrase_index_in_segment INTEGER NOT NULL, -- 0-based index within its segment's GPT analysis
+        text TEXT,
+        meaning_korean TEXT, -- Korean translation of the phrase
+        start_time_aligned REAL,
+        end_time_aligned REAL,
+        match_score REAL,
+        slowed_phrase_audio_path TEXT, -- Relative to AUDIO_DATA_ROOT_PATH
+        words_for_sync_json TEXT,      -- JSON for synchronized player (relative to phrase start)
+        FOREIGN KEY (segment_id) REFERENCES TranscriptSegments (segment_id) ON DELETE CASCADE,
+        UNIQUE (segment_id, phrase_index_in_segment)
+    );
+    """)
+
+    # PhraseWords Table (Breakdown of words within each analyzed phrase)
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS PhraseWords (
+        word_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        phrase_id INTEGER NOT NULL,
+        word_index_in_phrase INTEGER NOT NULL, -- Order of the word in the phrase
+        japanese TEXT,
+        kanji_chars TEXT,
+        romaji TEXT,
+        meaning_korean TEXT, -- Korean meaning/explanation of the word
+        FOREIGN KEY (phrase_id) REFERENCES AnalyzedPhrases (phrase_id) ON DELETE CASCADE,
+        UNIQUE (phrase_id, word_index_in_phrase)
+    );
+    """)
+
+    # PhraseKanji Table (Kanji explanations for each phrase)
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS PhraseKanji (
+        phrase_kanji_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        phrase_id INTEGER NOT NULL,
+        kanji_char TEXT NOT NULL,
+        reading TEXT,
+        meaning_korean_desc TEXT,
+        meaning_hanja_char TEXT,
+        FOREIGN KEY (phrase_id) REFERENCES AnalyzedPhrases (phrase_id) ON DELETE CASCADE,
+        UNIQUE (phrase_id, kanji_char, reading) -- A kanji might appear multiple times in a phrase if different readings, but usually not. This is a reasonable constraint.
+    );
+    """)
+
+    # GlobalKanji Table (For the "Kanji" tab, unique Kanji per video)
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS GlobalKanji (
+        global_kanji_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        video_id INTEGER NOT NULL,
+        kanji_char TEXT NOT NULL,
+        reading TEXT, -- Representative reading for this kanji in this video
+        meaning_korean_desc TEXT,
+        meaning_hanja_char TEXT,
+        FOREIGN KEY (video_id) REFERENCES Videos (video_id) ON DELETE CASCADE,
+        UNIQUE (video_id, kanji_char) -- Ensures one entry per Kanji char per video
+    );
+    """)
+
+    conn.commit()
+    conn.close()
+    print("Database initialized and tables created (if they didn't exist).")
+
+# --- Insertion Functions ---
+
+def add_video(youtube_url, video_title):
+    """Adds a new video entry or returns existing video_id if URL matches."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+        INSERT INTO Videos (youtube_url, video_title, processing_status)
+        VALUES (?, ?, 'pending')
+        """, (youtube_url, video_title))
+        video_id = cursor.lastrowid
+        conn.commit()
+        print(f"Added new video: ID {video_id}, URL: {youtube_url}")
+        return video_id, "new"
+    except sqlite3.IntegrityError: # youtube_url is UNIQUE
+        conn.rollback()
+        cursor.execute("SELECT video_id FROM Videos WHERE youtube_url = ?", (youtube_url,))
+        result = cursor.fetchone()
+        video_id = result['video_id'] if result else None
+        print(f"Video already exists: ID {video_id}, URL: {youtube_url}")
+        return video_id, "exists"
+    finally:
+        conn.close()
+
+def update_video_paths(video_id, original_audio_path=None, slowed_audio_path=None):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    if original_audio_path:
+        cursor.execute("UPDATE Videos SET original_audio_path = ? WHERE video_id = ?", (original_audio_path, video_id))
+    if slowed_audio_path:
+        cursor.execute("UPDATE Videos SET slowed_audio_path = ? WHERE video_id = ?", (slowed_audio_path, video_id))
+    conn.commit()
+    conn.close()
+    print(f"Updated paths for video ID {video_id}")
+
+def update_video_transcript_data(video_id, deepgram_json_str, full_plain_transcript_str, status='transcribed'):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+    UPDATE Videos SET deepgram_transcript_json = ?, full_plain_transcript = ?, processing_status = ?
+    WHERE video_id = ?
+    """, (deepgram_json_str, full_plain_transcript_str, status, video_id))
+    conn.commit()
+    conn.close()
+    print(f"Updated transcript data for video ID {video_id}, status: {status}")
+
+def update_video_status(video_id, status):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE Videos SET processing_status = ? WHERE video_id = ?", (status, video_id))
+    conn.commit()
+    conn.close()
+    print(f"Updated status for video ID {video_id} to {status}")
+
+def add_transcript_segment(video_id, segment_index, text_content, start_time, end_time, words_json_str):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+        INSERT INTO TranscriptSegments (video_id, segment_index, text_content, start_time_original, end_time_original, words_json)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """, (video_id, segment_index, text_content, start_time, end_time, words_json_str))
+        segment_id = cursor.lastrowid
+        conn.commit()
+        return segment_id
+    except sqlite3.IntegrityError: # (video_id, segment_index) UNIQUE
+        conn.rollback()
+        cursor.execute("SELECT segment_id FROM TranscriptSegments WHERE video_id = ? AND segment_index = ?", (video_id, segment_index))
+        result = cursor.fetchone()
+        return result['segment_id'] if result else None
+    finally:
+        conn.close()
+
+def update_segment_gpt_analysis(segment_id, gpt_analysis_json_str):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE TranscriptSegments SET gpt_analysis_json = ? WHERE segment_id = ?", (gpt_analysis_json_str, segment_id))
+    conn.commit()
+    conn.close()
+
+def add_analyzed_phrase(segment_id, phrase_index, text, meaning_korean, start_aligned, end_aligned, match_score, slowed_audio_path, words_sync_json):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+        INSERT INTO AnalyzedPhrases (segment_id, phrase_index_in_segment, text, meaning_korean, start_time_aligned, end_time_aligned, match_score, slowed_phrase_audio_path, words_for_sync_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (segment_id, phrase_index, text, meaning_korean, start_aligned, end_aligned, match_score, slowed_audio_path, words_sync_json))
+        phrase_id = cursor.lastrowid
+        conn.commit()
+        return phrase_id
+    except sqlite3.IntegrityError: # (segment_id, phrase_index_in_segment) UNIQUE
+        conn.rollback()
+        cursor.execute("SELECT phrase_id FROM AnalyzedPhrases WHERE segment_id = ? AND phrase_index_in_segment = ?", (segment_id, phrase_index))
+        result = cursor.fetchone()
+        return result['phrase_id'] if result else None
+    finally:
+        conn.close()
+
+def add_phrase_word(phrase_id, word_index, japanese, kanji_chars, romaji, meaning_korean):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+        INSERT INTO PhraseWords (phrase_id, word_index_in_phrase, japanese, kanji_chars, romaji, meaning_korean)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """, (phrase_id, word_index, japanese, kanji_chars, romaji, meaning_korean))
+        conn.commit()
+    except sqlite3.IntegrityError: # (phrase_id, word_index_in_phrase) UNIQUE
+        conn.rollback() # Word already exists for this phrase and index, skip.
+        print(f"Warning: PhraseWord already exists for phrase_id {phrase_id}, index {word_index}")
+        pass
+    finally:
+        conn.close()
+
+def add_phrase_kanji(phrase_id, kanji_char, reading, k_desc, h_mean):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+        INSERT INTO PhraseKanji (phrase_id, kanji_char, reading, meaning_korean_desc, meaning_hanja_char)
+        VALUES (?, ?, ?, ?, ?)
+        """, (phrase_id, kanji_char, reading, k_desc, h_mean))
+        conn.commit()
+    except sqlite3.IntegrityError: # (phrase_id, kanji_char, reading) UNIQUE
+        conn.rollback() # Kanji already exists for this phrase and reading, skip.
+        print(f"Warning: PhraseKanji already exists for phrase_id {phrase_id}, kanji {kanji_char}, reading {reading}")
+        pass
+    finally:
+        conn.close()
+
+def add_global_kanji(video_id, kanji_char, reading, k_desc, h_mean):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+        INSERT INTO GlobalKanji (video_id, kanji_char, reading, meaning_korean_desc, meaning_hanja_char)
+        VALUES (?, ?, ?, ?, ?)
+        """, (video_id, kanji_char, reading, k_desc, h_mean))
+        conn.commit()
+    except sqlite3.IntegrityError: # (video_id, kanji_char) UNIQUE
+        conn.rollback() # This specific kanji for this video already recorded, skip.
+        pass
+    finally:
+        conn.close()
+
+# --- Query/Checking Functions ---
+
+def get_video_by_url(youtube_url):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM Videos WHERE youtube_url = ?", (youtube_url,))
+    video_data = cursor.fetchone() # Returns a Row object or None
+    conn.close()
+    return video_data
+
+def get_video_by_id(video_id):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM Videos WHERE video_id = ?", (video_id,))
+    video_data = cursor.fetchone()
+    conn.close()
+    return video_data
+
+def check_if_analysis_complete(video_id):
+    """Checks if a video's processing_status is 'complete'."""
+    video = get_video_by_id(video_id)
+    if video and video['processing_status'] == 'complete':
+        return True
+    
+    # Fallback: More detailed check if needed (e.g., count segments and phrases)
+    # For now, relying on processing_status is simpler.
+    # conn = get_db_connection()
+    # cursor = conn.cursor()
+    # cursor.execute("SELECT COUNT(*) FROM TranscriptSegments WHERE video_id = ?", (video_id,))
+    # segment_count = cursor.fetchone()[0]
+    # cursor.execute("""
+    #     SELECT COUNT(ap.phrase_id)
+    #     FROM AnalyzedPhrases ap
+    #     JOIN TranscriptSegments ts ON ap.segment_id = ts.segment_id
+    #     WHERE ts.video_id = ?
+    # """, (video_id,))
+    # phrase_count = cursor.fetchone()[0]
+    # conn.close()
+    # return segment_count > 0 and phrase_count > 0 # Basic check, refine as needed
+    return False
+
+
+def get_segments_for_video(video_id):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM TranscriptSegments WHERE video_id = ? ORDER BY segment_index ASC", (video_id,))
+    segments = cursor.fetchall()
+    conn.close()
+    return segments
+
+def get_phrases_for_segment(segment_id):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM AnalyzedPhrases WHERE segment_id = ? ORDER BY phrase_index_in_segment ASC", (segment_id,))
+    phrases = cursor.fetchall()
+    conn.close()
+    return phrases
+
+def get_words_for_phrase(phrase_id):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM PhraseWords WHERE phrase_id = ? ORDER BY word_index_in_phrase ASC", (phrase_id,))
+    words = cursor.fetchall()
+    conn.close()
+    return words
+
+def get_kanji_for_phrase(phrase_id):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM PhraseKanji WHERE phrase_id = ?", (phrase_id,))
+    kanji_list = cursor.fetchall()
+    conn.close()
+    return kanji_list
+
+def get_global_kanji_for_video(video_id):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT kanji_char, reading, meaning_korean_desc, meaning_hanja_char FROM GlobalKanji WHERE video_id = ? ORDER BY kanji_char ASC", (video_id,))
+    kanji_data = cursor.fetchall() # Returns a list of Row objects
+    conn.close()
+    # Convert Row objects to simple dicts if preferred for consistency elsewhere
+    return [dict(row) for row in kanji_data]
+
+
+if __name__ == '__main__':
+    # This will create the DB and tables if you run `python db_utils.py`
+    init_db()
+    print(f"Database utility script finished. DB should be at {DATABASE_PATH}")
+
+    # Example usage (optional, for testing db_utils.py directly)
+    # video_id_new, status = add_video("https://www.youtube.com/watch?v=test123xyz", "Test Video Title")
+    # if status == "new":
+    #     update_video_paths(video_id_new, original_audio_path="test/original.mp3", slowed_audio_path="test/slowed.mp3")
+    #     update_video_transcript_data(video_id_new, '{"some": "json"}', "Full text here", status='transcribed')
+    #     update_video_status(video_id_new, 'complete')
+
+    # existing_video = get_video_by_url("https://www.youtube.com/watch?v=test123xyz")
+    # if existing_video:
+    #     print(f"Fetched existing video: {dict(existing_video)}")
+    #     print(f"Is analysis complete? {check_if_analysis_complete(existing_video['video_id'])}")
+
+# In db_utils.py
+def update_analyzed_phrase_audio_path(phrase_id, audio_path):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE AnalyzedPhrases SET slowed_phrase_audio_path = ? WHERE phrase_id = ?", (audio_path, phrase_id))
+    conn.commit()
+    conn.close()
+
+def update_video_title(video_id, title):
+    """Updates the title of an existing video."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("UPDATE Videos SET video_title = ? WHERE video_id = ?", (title, video_id))
+        conn.commit()
+        print(f"Updated title for video ID {video_id} to '{title}'")
+    except sqlite3.Error as e:
+        print(f"Database error updating video title for ID {video_id}: {e}")
+        conn.rollback() # Rollback on error
+    finally:
+        conn.close()

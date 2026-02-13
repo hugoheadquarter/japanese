@@ -1,87 +1,104 @@
 # lib/database.py
-"""Single canonical database module.
+"""Database access layer — all queries go through the Supabase Python client.
 
-All DB access goes through this module.
-Uses a single connection per call-site, passed through the pipeline.
+Every function is self-contained (fetches the client internally) so callers
+never need to manage connections or transactions.
 """
 
-import sqlite3
+from __future__ import annotations
 import json
-from pathlib import Path
-from config import DB_PATH
-
-
-def get_db_connection() -> sqlite3.Connection:
-    """Get a database connection with WAL mode and foreign keys enabled."""
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA foreign_keys=ON;")
-    return conn
+from lib.supabase_client import get_supabase
 
 
 # ---------------------------------------------------------------------------
 # Video CRUD
 # ---------------------------------------------------------------------------
 
-def get_all_videos(conn: sqlite3.Connection):
-    return conn.execute(
-        "SELECT id, youtube_url, video_title, video_data_directory, created_at "
-        "FROM Videos ORDER BY created_at DESC"
-    ).fetchall()
-
-
-def get_video_by_url(conn: sqlite3.Connection, url: str):
-    return conn.execute(
-        "SELECT id, video_title, video_data_directory FROM Videos WHERE youtube_url = ?",
-        (url,),
-    ).fetchone()
-
-
-def get_video_by_id(conn: sqlite3.Connection, video_id: int):
-    return conn.execute("SELECT * FROM Videos WHERE id = ?", (video_id,)).fetchone()
-
-
-def insert_video(conn: sqlite3.Connection, url: str, title: str) -> int:
-    cursor = conn.execute(
-        "INSERT INTO Videos (youtube_url, video_title) VALUES (?, ?)", (url, title)
+def get_all_videos() -> list[dict]:
+    sb = get_supabase()
+    resp = (
+        sb.table("videos")
+        .select("id, youtube_url, video_title, video_data_directory, created_at")
+        .order("created_at", desc=True)
+        .execute()
     )
-    conn.commit()
-    return cursor.lastrowid
+    return resp.data
 
 
-def update_video_directory(conn: sqlite3.Connection, video_id: int, dir_name: str):
-    conn.execute(
-        "UPDATE Videos SET video_data_directory = ? WHERE id = ?",
-        (dir_name, video_id),
+def get_video_by_url(url: str) -> dict | None:
+    sb = get_supabase()
+    resp = (
+        sb.table("videos")
+        .select("id, video_title, video_data_directory")
+        .eq("youtube_url", url)
+        .execute()
     )
+    if resp.data:
+        return resp.data[0]
+    return None
 
 
-def update_video_audio(conn: sqlite3.Connection, video_id: int, audio_filename: str):
-    conn.execute(
-        "UPDATE Videos SET full_slowed_audio_path = ? WHERE id = ?",
-        (audio_filename, video_id),
+def get_video_by_id(video_id: int) -> dict | None:
+    sb = get_supabase()
+    resp = (
+        sb.table("videos")
+        .select("*")
+        .eq("id", video_id)
+        .execute()
     )
+    if resp.data:
+        return resp.data[0]
+    return None
+
+
+def insert_video(url: str, title: str) -> int:
+    """Insert a new video row.  Returns the new ``id``."""
+    sb = get_supabase()
+    resp = (
+        sb.table("videos")
+        .insert({"youtube_url": url, "video_title": title})
+        .execute()
+    )
+    return resp.data[0]["id"]
+
+
+def update_video_directory(video_id: int, dir_name: str):
+    sb = get_supabase()
+    sb.table("videos").update({"video_data_directory": dir_name}).eq("id", video_id).execute()
+
+
+def update_video_audio(video_id: int, audio_storage_path: str):
+    sb = get_supabase()
+    sb.table("videos").update({"full_slowed_audio_path": audio_storage_path}).eq("id", video_id).execute()
 
 
 def update_video_transcript(
-    conn: sqlite3.Connection,
     video_id: int,
-    raw_json_str: str,
+    raw_deepgram: dict,
     full_text: str,
-    sync_words_json: str,
+    sync_words: list[dict],
 ):
-    conn.execute(
-        "UPDATE Videos SET raw_deepgram_response_json=?, full_transcript_text=?, "
-        "full_words_for_sync_json=? WHERE id=?",
-        (raw_json_str, full_text, sync_words_json, video_id),
-    )
+    sb = get_supabase()
+    sb.table("videos").update({
+        "raw_deepgram_response_json": raw_deepgram,
+        "full_transcript_text": full_text,
+        "full_words_for_sync_json": sync_words,
+    }).eq("id", video_id).execute()
 
 
-def delete_video(conn: sqlite3.Connection, video_id: int):
-    """Delete video and all cascading data."""
-    conn.execute("DELETE FROM Videos WHERE id = ?", (video_id,))
-    conn.commit()
+def update_video_debug(video_id: int, debug_data: dict):
+    """Store segmentation / analysis debug JSON."""
+    sb = get_supabase()
+    sb.table("videos").update({"debug_json": debug_data}).eq("id", video_id).execute()
+
+
+def delete_video(video_id: int) -> str | None:
+    """Delete video (CASCADE removes children).  Returns video_data_directory."""
+    sb = get_supabase()
+    resp = sb.rpc("delete_video_returning_dir", {"p_video_id": video_id}).execute()
+    if resp.data:
+        return resp.data
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -89,27 +106,40 @@ def delete_video(conn: sqlite3.Connection, video_id: int):
 # ---------------------------------------------------------------------------
 
 def insert_segment(
-    conn: sqlite3.Connection,
     video_id: int,
     seg_idx: int,
     text: str,
     start: float,
     end: float,
-    words_json: str,
+    words: list[dict],
 ) -> int:
-    cursor = conn.execute(
-        "INSERT INTO Segments (video_id, segment_index, text, start_time, end_time, "
-        "deepgram_segment_words_json) VALUES (?,?,?,?,?,?)",
-        (video_id, seg_idx, text, start, end, words_json),
+    """Insert one segment row.  Returns the new ``id``."""
+    sb = get_supabase()
+    resp = (
+        sb.table("segments")
+        .insert({
+            "video_id": video_id,
+            "segment_index": seg_idx,
+            "text": text,
+            "start_time": start,
+            "end_time": end,
+            "deepgram_segment_words_json": words,
+        })
+        .execute()
     )
-    return cursor.lastrowid
+    return resp.data[0]["id"]
 
 
-def get_segments_for_video(conn: sqlite3.Connection, video_id: int):
-    return conn.execute(
-        "SELECT * FROM Segments WHERE video_id = ? ORDER BY segment_index",
-        (video_id,),
-    ).fetchall()
+def get_segments_for_video(video_id: int) -> list[dict]:
+    sb = get_supabase()
+    resp = (
+        sb.table("segments")
+        .select("*")
+        .eq("video_id", video_id)
+        .order("segment_index")
+        .execute()
+    )
+    return resp.data
 
 
 # ---------------------------------------------------------------------------
@@ -117,89 +147,108 @@ def get_segments_for_video(conn: sqlite3.Connection, video_id: int):
 # ---------------------------------------------------------------------------
 
 def insert_phrase_analysis(
-    conn: sqlite3.Connection,
     segment_id: int,
     phrase_idx: int,
-    gpt_json_str: str,
+    gpt_json: dict,
     audio_path: str | None,
-    sync_words_json: str,
+    sync_words: list[dict],
 ):
-    conn.execute(
-        "INSERT INTO GptPhraseAnalyses "
-        "(segment_id, phrase_index_in_segment, gpt_phrase_json, "
-        "phrase_slowed_audio_path, phrase_words_for_sync_json) "
-        "VALUES (?,?,?,?,?)",
-        (segment_id, phrase_idx, gpt_json_str, audio_path, sync_words_json),
+    sb = get_supabase()
+    sb.table("gpt_phrase_analyses").insert({
+        "segment_id": segment_id,
+        "phrase_index_in_segment": phrase_idx,
+        "gpt_phrase_json": gpt_json,
+        "phrase_slowed_audio_path": audio_path,
+        "phrase_words_for_sync_json": sync_words,
+    }).execute()
+
+
+def batch_insert_phrase_analyses(rows: list[dict]):
+    """Insert multiple phrase analyses in one call.
+
+    Each dict: {segment_id, phrase_index_in_segment, gpt_phrase_json,
+                phrase_slowed_audio_path, phrase_words_for_sync_json}
+    """
+    if not rows:
+        return
+    sb = get_supabase()
+    sb.table("gpt_phrase_analyses").insert(rows).execute()
+
+
+def get_phrase_analyses_for_segment(segment_id: int) -> list[dict]:
+    sb = get_supabase()
+    resp = (
+        sb.table("gpt_phrase_analyses")
+        .select("*")
+        .eq("segment_id", segment_id)
+        .order("phrase_index_in_segment")
+        .execute()
     )
+    return resp.data
 
 
-def get_phrase_analyses_for_segment(conn: sqlite3.Connection, segment_id: int):
-    return conn.execute(
-        "SELECT * FROM GptPhraseAnalyses WHERE segment_id = ? "
-        "ORDER BY phrase_index_in_segment",
-        (segment_id,),
-    ).fetchall()
+def get_all_phrase_analyses_for_video(video_id: int) -> list[dict]:
+    """Fetch all phrase analyses for a video, ordered by segment + phrase index.
 
-
-def get_all_phrase_analyses_for_video(conn: sqlite3.Connection, video_id: int):
-    return conn.execute(
-        "SELECT gpa.gpt_phrase_json, gpa.phrase_words_for_sync_json "
-        "FROM GptPhraseAnalyses gpa "
-        "JOIN Segments s ON gpa.segment_id = s.id "
-        "WHERE s.video_id = ?",
-        (video_id,),
-    ).fetchall()
+    Uses an RPC function to perform the JOIN server-side.
+    """
+    sb = get_supabase()
+    resp = sb.rpc("get_phrase_analyses_for_video", {"p_video_id": video_id}).execute()
+    return resp.data
 
 
 # ---------------------------------------------------------------------------
 # Kanji CRUD
 # ---------------------------------------------------------------------------
 
-def insert_kanji_entry(
-    conn: sqlite3.Connection, video_id: int, char: str, reading: str, meaning: str
-):
-    try:
-        conn.execute(
-            "INSERT INTO KanjiEntries (video_id, character, reading, meaning) "
-            "VALUES (?,?,?,?)",
-            (video_id, char, reading, meaning),
-        )
-    except sqlite3.IntegrityError:
-        pass  # Already exists
+def get_kanji_for_video(video_id: int) -> list[dict]:
+    sb = get_supabase()
+    resp = (
+        sb.table("kanji_entries")
+        .select("character, reading, meaning")
+        .eq("video_id", video_id)
+        .execute()
+    )
+    return resp.data
 
 
-def get_kanji_for_video(conn: sqlite3.Connection, video_id: int):
-    return conn.execute(
-        "SELECT character, reading, meaning FROM KanjiEntries WHERE video_id = ?",
-        (video_id,),
-    ).fetchall()
-
-
-def extract_and_store_kanji(conn: sqlite3.Connection, video_id: int):
-    """Extract unique kanji from all phrase analyses and store in KanjiEntries."""
-    rows = get_all_phrase_analyses_for_video(conn, video_id)
-    unique_kanji = {}
+def extract_and_store_kanji(video_id: int):
+    """Extract unique kanji from all phrase analyses and bulk-upsert into kanji_entries."""
+    rows = get_all_phrase_analyses_for_video(video_id)
+    unique_kanji: dict[str, dict] = {}
     for row in rows:
-        gd = json.loads(row["gpt_phrase_json"])
+        gd = row["gpt_phrase_json"]
+        # gd is already a dict (JSONB → Python dict via Supabase)
+        if isinstance(gd, str):
+            gd = json.loads(gd)
         for ke in gd.get("kanji_explanations", []):
             char = ke.get("kanji")
             if char and char not in unique_kanji:
                 unique_kanji[char] = {
+                    "character": char,
                     "reading": ke.get("reading", ""),
                     "meaning": ke.get("meaning", ""),
                 }
-    for char, info in unique_kanji.items():
-        insert_kanji_entry(conn, video_id, char, info["reading"], info["meaning"])
-    conn.commit()
+    if not unique_kanji:
+        return
+
+    entries = list(unique_kanji.values())
+    sb = get_supabase()
+    sb.rpc("upsert_kanji_entries", {
+        "p_video_id": video_id,
+        "p_entries": entries,
+    }).execute()
 
 
-def load_kanji_first_occurrences(conn: sqlite3.Connection, video_id: int) -> dict:
-    """Return {kanji_char: (first_start_time, sequence_index)}."""
-    earliest = {}
+def load_kanji_first_occurrences(video_id: int) -> dict:
+    """Return ``{kanji_char: (first_start_time, sequence_index)}``."""
+    rows = get_all_phrase_analyses_for_video(video_id)
+    earliest: dict[str, tuple] = {}
     seq = 0
-    rows = get_all_phrase_analyses_for_video(conn, video_id)
     for row in rows:
-        phr = json.loads(row["gpt_phrase_json"])
+        phr = row["gpt_phrase_json"]
+        if isinstance(phr, str):
+            phr = json.loads(phr)
         t0 = phr.get("original_start_time") or float("inf")
         for ke in phr.get("kanji_explanations", []):
             k = ke.get("kanji")
@@ -207,24 +256,3 @@ def load_kanji_first_occurrences(conn: sqlite3.Connection, video_id: int) -> dic
                 earliest[k] = (t0, seq)
                 seq += 1
     return earliest
-
-
-# ---------------------------------------------------------------------------
-# Batch operations
-# ---------------------------------------------------------------------------
-
-def batch_insert_phrase_analyses(
-    conn: sqlite3.Connection,
-    rows: list[tuple],
-):
-    """Insert multiple phrase analyses in one executemany call.
-
-    Each tuple: (segment_id, phrase_idx, gpt_json_str, audio_path, sync_json)
-    """
-    conn.executemany(
-        "INSERT INTO GptPhraseAnalyses "
-        "(segment_id, phrase_index_in_segment, gpt_phrase_json, "
-        "phrase_slowed_audio_path, phrase_words_for_sync_json) "
-        "VALUES (?,?,?,?,?)",
-        rows,
-    )

@@ -28,7 +28,7 @@ from lib.players import (
     create_vocab_component,
 )
 
-st.set_page_config(layout="wide", page_title="복습")
+st.set_page_config(page_title="복습")
 
 
 # --- Caching (same pattern as jp.py) ---
