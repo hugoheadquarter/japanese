@@ -6,9 +6,3 @@ pydub
 requests
 rapidfuzz
 audioop-lts
-yt-dlp-ejs
-pybalt
-pyyaml
-python-dotenv
-aiohttp
-aiofiles
