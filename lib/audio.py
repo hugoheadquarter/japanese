@@ -24,6 +24,9 @@ from pydub import AudioSegment
 # ---------------------------------------------------------------------------
 
 PIPED_INSTANCES = [
+    # --- CONFIRMED ALIVE (from piped-instances.kavin.rocks) ---
+    "https://api.piped.private.coffee",
+    # --- Others to try (may come back online) ---
     "https://pipedapi.kavin.rocks",
     "https://pipedapi.leptons.xyz",
     "https://pipedapi-libre.kavin.rocks",
@@ -31,16 +34,6 @@ PIPED_INSTANCES = [
     "https://api.piped.yt",
     "https://pipedapi.nosebs.ru",
     "https://pipedapi.r4fo.com",
-    "https://piped-api.privacy.com.de",
-    "https://pipedapi.drgns.space",
-    "https://pipedapi.tokhmi.xyz",
-    "https://pipedapi.moomoo.me",
-    "https://pipedapi.syncpundit.io",
-    "https://piped-api.lunar.icu",
-    "https://ytapi.dc09.ru",
-    "https://pa.il.ax",
-    "https://pa.mint.lgbt",
-    "https://pipedapi.colinslegacy.com",
 ]
 
 INVIDIOUS_INSTANCES = [
