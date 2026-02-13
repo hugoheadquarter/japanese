@@ -182,7 +182,7 @@ if st.session_state.confirm_del == vid_id:
 
 
 # --- Tabs ---
-tabs = st.tabs(["Full Transcript", "Breakdown", "단어", "Kanji", "Text", "VIDEO"])
+tabs = st.tabs(["스크립트", "문장", "단어", "한자", "텍스트", "VIDEO"])
 tab1, tab2, tab_vocab, tab3, tab4, tab_video = tabs
 
 
