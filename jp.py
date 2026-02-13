@@ -258,13 +258,7 @@ def populate_vocab_tab(tab, video_id: int, video_dir: str, audio_fn: str | None)
             st.info("한자가 포함된 단어가 없습니다.")
             return
 
-        col1, col2 = st.columns([3, 1])
-        with col1:
-            fq = st.text_input("검색", "", key=f"vf_{video_id}")
-        with col2:
-            sort = st.selectbox("정렬", ["시간순", "일본어순", "한자순"], key=f"vs_{video_id}")
-
-        html = create_vocab_component(vocab, video_dir, audio_fn, fq, sort)
+        html = create_vocab_component(vocab, video_dir, audio_fn)
         h = min(800, len(vocab) * 150 + 200)
         st.components.v1.html(html, height=h, scrolling=True)
 
@@ -325,19 +319,35 @@ def populate_text_tab(tab, full_text: str, title: str):
             )
 
 
-def populate_json_tab(tab, raw_json_str: str, title: str):
+def _extract_youtube_id(url: str) -> str | None:
+    """Extract video ID from various YouTube URL formats."""
+    import re
+    patterns = [
+        r'(?:v=|/v/|youtu\.be/)([a-zA-Z0-9_-]{11})',
+        r'(?:embed/)([a-zA-Z0-9_-]{11})',
+        r'^([a-zA-Z0-9_-]{11})$',
+    ]
+    for p in patterns:
+        m = re.search(p, url)
+        if m:
+            return m.group(1)
+    return None
+
+
+def populate_video_tab(tab, youtube_url: str):
+    """Embed the YouTube video."""
     with tab:
-        if raw_json_str:
-            try:
-                st.json(json.loads(raw_json_str))
-            except json.JSONDecodeError:
-                st.error("JSON data corrupted.")
-            st.download_button(
-                "Download",
-                raw_json_str.encode("utf-8"),
-                f"{title or 'video'}_deepgram.json",
-                "application/json",
+        vid_id = _extract_youtube_id(youtube_url)
+        if vid_id:
+            st.components.v1.html(
+                f'<iframe width="100%" height="500" src="https://www.youtube.com/embed/{vid_id}" '
+                f'frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; '
+                f'gyroscope; picture-in-picture" allowfullscreen></iframe>',
+                height=520,
             )
+        else:
+            st.warning("YouTube URL을 인식할 수 없습니다.")
+            st.markdown(f"[YouTube에서 열기]({youtube_url})")
 
 
 # ---------------------------------------------------------------------------
@@ -379,8 +389,8 @@ def display_existing_video(video_id: int):
     conn.close()
 
     # Create tabs
-    tabs = st.tabs(["스크립트", "문장", "단어", "한자", "텍스트", "JSON"])
-    tab_script, tab_breakdown, tab_vocab, tab_kanji, tab_text, tab_json = tabs
+    tabs = st.tabs(["스크립트", "문장", "단어", "한자", "텍스트", "VIDEO"])
+    tab_script, tab_breakdown, tab_vocab, tab_kanji, tab_text, tab_video = tabs
 
     populate_transcript_tab(
         tab_script, video_dir, audio_fn, video.get("full_words_for_sync_json", "[]")
@@ -389,7 +399,7 @@ def display_existing_video(video_id: int):
     populate_vocab_tab(tab_vocab, video_id, video_dir, audio_fn)
     populate_kanji_tab(tab_kanji, video_id)
     populate_text_tab(tab_text, video.get("full_transcript_text", ""), title)
-    populate_json_tab(tab_json, video.get("raw_deepgram_response_json", ""), title)
+    populate_video_tab(tab_video, video.get("youtube_url", ""))
 
 
 # ---------------------------------------------------------------------------
@@ -483,8 +493,8 @@ def run_full_pipeline(url: str, force: bool):
         conn.commit()
 
         # Create tabs
-        tabs = st.tabs(["스크립트", "문장", "단어", "한자", "텍스트", "JSON"])
-        tab_script, tab_breakdown, tab_vocab, tab_kanji, tab_text, tab_json = tabs
+        tabs = st.tabs(["스크립트", "문장", "단어", "한자", "텍스트", "VIDEO"])
+        tab_script, tab_breakdown, tab_vocab, tab_kanji, tab_text, tab_video = tabs
 
         # Fill tab 1: Full transcript
         with tab_script:
@@ -494,9 +504,8 @@ def run_full_pipeline(url: str, force: bool):
         with tab_text:
             st.text_area("전체 텍스트", full_text, height=300, label_visibility="collapsed")
 
-        # Fill tab 6: JSON
-        with tab_json:
-            st.json(transcript)
+        # Fill tab 6: VIDEO
+        populate_video_tab(tab_video, url)
 
         # --- Save segmentation debug immediately ---
         seg_debug_path = video_dir_abs / "claude_segmentation.json"

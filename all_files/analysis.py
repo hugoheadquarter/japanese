@@ -1,19 +1,24 @@
 # lib/analysis.py
-"""Claude Opus 4.6 analysis, Deepgram transcription, alignment, segmentation."""
+"""Claude analysis, Deepgram transcription, alignment, segmentation.
+
+Modified for Streamlit Cloud: API keys from st.secrets instead of os.getenv.
+"""
+
+from __future__ import annotations
 
 import json
-import os
 import re
 import time
-import requests
 import traceback
+
+import requests
+import streamlit as st
 import anthropic
 from lib.utils import normalize_japanese, norm_for_alignment
 
 # Try to import fuzzy matching
 try:
     from rapidfuzz import process, fuzz
-
     FUZZY_MATCHING_AVAILABLE = True
 except ImportError:
     FUZZY_MATCHING_AVAILABLE = False
@@ -28,9 +33,11 @@ _claude_client: anthropic.Anthropic | None = None
 def get_claude_client() -> anthropic.Anthropic | None:
     global _claude_client
     if _claude_client is None:
-        api_key = os.getenv("ANTHROPIC_API_KEY")
+        api_key = st.secrets.get("ANTHROPIC_API_KEY")
         if api_key:
             _claude_client = anthropic.Anthropic(api_key=api_key)
+        else:
+            print("[DIAG] ANTHROPIC_API_KEY not found in secrets!")
     return _claude_client
 
 
@@ -40,7 +47,7 @@ def get_claude_client() -> anthropic.Anthropic | None:
 
 def transcribe_audio(audio_path: str) -> dict | None:
     """Transcribe audio using Deepgram API."""
-    api_key = os.getenv("DEEPGRAM_API_KEY")
+    api_key = st.secrets.get("DEEPGRAM_API_KEY")
     if not api_key:
         print("Deepgram API key missing.")
         return None
@@ -81,10 +88,79 @@ def transcribe_audio(audio_path: str) -> dict | None:
 # Segmentation
 # ---------------------------------------------------------------------------
 
+SEGMENTATION_PROMPT = """You are segmenting a Japanese transcript for a beginner Korean learner.
+
+Below is a numbered word list from a speech transcript. Group these words into segments that:
+- Are complete thoughts/sentences (never split mid-clause)
+- Have 5-20 words each (ideal: 8-15)
+- Keep tiny utterances (はい、うん、ええ) attached to the sentence before or after, never alone
+- Split at natural sentence boundaries (。？！) or at commas (、) when the sentence is long
+- Consider context: a reaction like おっ！ should stay with what it's reacting to
+
+Return ONLY a JSON array of [start, end] index pairs. Every word must be covered, no gaps, no overlaps.
+
+Example input:
+[1]はい。 [2]最近 [3]は [4]無双 [5]ですから、 [6]男 [7]の [8]人 [9]も
+
+Example output:
+[[1,9]]
+
+Return ONLY the JSON array."""
+
+
+def _strip_json_fences(text: str) -> str:
+    """Remove markdown code fences wrapping JSON."""
+    text = text.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+    return text.strip()
+
+
+def _build_numbered_word_list(all_words: list[dict]) -> str:
+    parts = []
+    for i, w in enumerate(all_words):
+        text = w.get("punctuated_word", w.get("word", "")).strip()
+        parts.append(f"[{i+1}]{text}")
+    return " ".join(parts)
+
+
+def _validate_and_fix_ranges(ranges: list, total_words: int) -> list[list[int]]:
+    if not ranges:
+        return [[1, total_words]]
+
+    clean = []
+    for r in ranges:
+        if isinstance(r, (list, tuple)) and len(r) >= 2:
+            s, e = int(r[0]), int(r[1])
+            if 1 <= s <= total_words and 1 <= e <= total_words and s <= e:
+                clean.append([s, e])
+    if not clean:
+        return [[1, total_words]]
+
+    clean.sort(key=lambda x: x[0])
+
+    fixed = [clean[0]]
+    for i in range(1, len(clean)):
+        prev_end = fixed[-1][1]
+        cur_start, cur_end = clean[i]
+        if cur_start != prev_end + 1:
+            cur_start = prev_end + 1
+        if cur_start > cur_end:
+            continue
+        fixed.append([cur_start, cur_end])
+
+    if fixed[-1][1] < total_words:
+        fixed[-1][1] = total_words
+    if fixed[0][0] > 1:
+        fixed[0][0] = 1
+
+    return fixed
+
+
 def prepare_japanese_segments(
     transcript_data: dict,
-) -> tuple[str | None, list[dict]]:
-    """Split transcript into segments on punctuation or max word count."""
+) -> tuple[str | None, list[dict], dict]:
     try:
         alt = (
             transcript_data.get("results", {})
@@ -93,40 +169,101 @@ def prepare_japanese_segments(
         )
         all_words = alt.get("words", [])
         if not all_words:
-            return "", []
+            return "", [], {}
 
         full_transcript = alt.get("transcript", "").replace(" ", "")
+        numbered = _build_numbered_word_list(all_words)
+
+        print(f"[SEGMENTATION] Attempting Claude segmentation for {len(all_words)} words...")
+        ranges, raw_response = _claude_segment(all_words)
+        used_fallback = False
+        if not ranges:
+            print("[SEGMENTATION] Claude returned None — using FALLBACK.")
+            ranges = _fallback_segment_ranges(all_words)
+            used_fallback = True
+        else:
+            print(f"[SEGMENTATION] Claude returned {len(ranges)} segments.")
+
+        ranges = _validate_and_fix_ranges(ranges, len(all_words))
+
         segments = []
-        current_words = []
-        MAX_WORDS = 30
+        for s, e in ranges:
+            grp = all_words[s-1:e]
+            if not grp:
+                continue
+            seg_text = "".join(
+                w.get("punctuated_word", w.get("word", "")).strip().replace(" ", "")
+                for w in grp
+            )
+            segments.append({
+                "start": grp[0]["start"],
+                "end": grp[-1]["end"],
+                "text": seg_text,
+                "words": [dict(w) for w in grp],
+            })
 
-        for i, word_info in enumerate(all_words):
-            current_words.append(word_info)
-            text = word_info.get("punctuated_word", word_info["word"]).strip()
-            is_punct = any(p in text for p in "。？！")
-            is_max = len(current_words) >= MAX_WORDS
-            is_last = i == len(all_words) - 1
+        debug_info = {
+            "numbered_word_list": numbered,
+            "claude_raw_response": raw_response,
+            "ranges_after_validation": ranges,
+            "used_fallback": used_fallback,
+            "total_words": len(all_words),
+            "total_segments": len(segments),
+        }
 
-            if (is_punct or is_max or is_last) and current_words:
-                seg_text = "".join(
-                    w.get("punctuated_word", w.get("word", "")).strip().replace(" ", "")
-                    for w in current_words
-                )
-                segments.append(
-                    {
-                        "start": current_words[0]["start"],
-                        "end": current_words[-1]["end"],
-                        "text": seg_text,
-                        "words": [dict(w) for w in current_words],
-                    }
-                )
-                current_words = []
-
-        return full_transcript, segments
+        return full_transcript, segments, debug_info
     except Exception as e:
         print(f"Segment prep error: {e}")
         traceback.print_exc()
-        return None, []
+        return None, [], {}
+
+
+def _claude_segment(all_words: list[dict]) -> tuple[list[list[int]] | None, str | None]:
+    client = get_claude_client()
+    if not client:
+        return None, None
+
+    numbered = _build_numbered_word_list(all_words)
+    total = len(all_words)
+
+    try:
+        message = client.messages.create(
+            model="claude-opus-4-6",
+            max_tokens=4096,
+            messages=[{
+                "role": "user",
+                "content": f"{SEGMENTATION_PROMPT}\n\nTotal words: {total}\n\n{numbered}",
+            }],
+        )
+        raw_text = message.content[0].text
+        response_text = _strip_json_fences(raw_text)
+        ranges = json.loads(response_text)
+
+        if isinstance(ranges, list) and len(ranges) > 0:
+            return ranges, raw_text
+        return None, raw_text
+
+    except json.JSONDecodeError as e:
+        print(f"[SEGMENTATION] JSON parse error: {e}")
+        return None, None
+    except Exception as e:
+        print(f"[SEGMENTATION] API call error: {type(e).__name__}: {e}")
+        return None, None
+
+
+def _fallback_segment_ranges(all_words: list[dict]) -> list[list[int]]:
+    ranges = []
+    start = 1
+    for i, w in enumerate(all_words):
+        idx = i + 1
+        text = w.get("punctuated_word", w.get("word", "")).strip()
+        is_punct = any(p in text for p in "。？！")
+        is_last = idx == len(all_words)
+        count = idx - start + 1
+        if is_punct or count >= 20 or is_last:
+            ranges.append([start, idx])
+            start = idx + 1
+    return ranges
 
 
 # ---------------------------------------------------------------------------
@@ -136,7 +273,6 @@ def prepare_japanese_segments(
 def extract_words_for_sync(
     transcript_data: dict, speed_factor: float = 0.75, time_offset: float = 0.3
 ) -> list[dict]:
-    """Extract word timing data adjusted for slowed audio."""
     try:
         alt = (
             transcript_data.get("results", {})
@@ -152,13 +288,11 @@ def extract_words_for_sync(
         for w in raw_words:
             s = w.get("start", 0) * adj
             e = w.get("end", 0) * adj
-            result.append(
-                {
-                    "text": w.get("punctuated_word", w.get("word", "")),
-                    "start": max(0, s - time_offset),
-                    "end": max(0.01, e - time_offset),
-                }
-            )
+            result.append({
+                "text": w.get("punctuated_word", w.get("word", "")),
+                "start": max(0, s - time_offset),
+                "end": max(0.01, e - time_offset),
+            })
         return result
     except Exception as e:
         print(f"Word sync error: {e}")
@@ -172,7 +306,6 @@ def extract_phrase_words_for_sync(
     speed_factor: float = 0.75,
     time_offset: float = 0.3,
 ) -> list[dict]:
-    """Extract word timings for a specific phrase, relative to phrase start."""
     try:
         alt = (
             transcript_data.get("results", {})
@@ -188,17 +321,14 @@ def extract_phrase_words_for_sync(
         for w in raw_words:
             ws = w.get("start", 0)
             we = w.get("end", 0)
-            # STRICT containment: word must be fully within phrase bounds
             if ws >= phrase_start_orig and we <= phrase_end_orig:
                 rs = (ws - phrase_start_orig) * adj
                 re_ = (we - phrase_start_orig) * adj
-                result.append(
-                    {
-                        "text": w.get("punctuated_word", w.get("word", "")),
-                        "start": max(0, rs - time_offset),
-                        "end": max(0.01, re_ - time_offset),
-                    }
-                )
+                result.append({
+                    "text": w.get("punctuated_word", w.get("word", "")),
+                    "start": max(0, rs - time_offset),
+                    "end": max(0.01, re_ - time_offset),
+                })
         return result
     except Exception as e:
         print(f"Phrase sync error: {e}")
@@ -206,7 +336,7 @@ def extract_phrase_words_for_sync(
 
 
 # ---------------------------------------------------------------------------
-# Alignment (FIXED: sequential, no overlap)
+# Alignment
 # ---------------------------------------------------------------------------
 
 def align_gpt_phrase_to_deepgram_words(
@@ -215,12 +345,6 @@ def align_gpt_phrase_to_deepgram_words(
     search_start_index: int = 0,
     min_match_score: float = 70,
 ) -> tuple[float, float, float, int]:
-    """Align a GPT phrase to Deepgram word timings.
-
-    FIXED: Accepts search_start_index to prevent overlap with previous phrases.
-
-    Returns: (start_time, end_time, match_score, end_word_index)
-    """
     if not gpt_phrase_text or not deepgram_words:
         return 0, 0, 0, search_start_index
 
@@ -228,18 +352,13 @@ def align_gpt_phrase_to_deepgram_words(
     if not norm_phrase:
         return 0, 0, 0, search_start_index
 
-    # Only search from search_start_index onwards
     search_words = deepgram_words[search_start_index:]
-
     if not search_words:
-        # Fallback to last word
         last = deepgram_words[-1]
         return last["start"], last["end"], 0, len(deepgram_words)
 
     if FUZZY_MATCHING_AVAILABLE:
-        return _align_fuzzy(
-            norm_phrase, deepgram_words, search_start_index, min_match_score
-        )
+        return _align_fuzzy(norm_phrase, deepgram_words, search_start_index, min_match_score)
     else:
         return _align_fallback(norm_phrase, deepgram_words, search_start_index)
 
@@ -250,7 +369,6 @@ def _align_fuzzy(
     start_idx: int,
     min_score: float,
 ) -> tuple[float, float, float, int]:
-    """Fuzzy alignment searching only from start_idx onwards."""
     best_score = 0
     best_si = start_idx
     best_ei = start_idx
@@ -268,23 +386,21 @@ def _align_fuzzy(
                 continue
 
             score = fuzz.ratio(normalized_phrase, window_text)
-            # Slight bonus for longer matches
             adj_score = score * (1 + 0.01 * len(window_text))
 
             if adj_score > best_score:
                 best_score = adj_score
                 best_si = si
-                best_ei = ei - 1  # inclusive end index
+                best_ei = ei - 1
 
     if best_score >= min_score and best_ei < n:
         return (
             all_words[best_si]["start"],
             all_words[best_ei]["end"],
             best_score,
-            best_ei + 1,  # next phrase starts after this
+            best_ei + 1,
         )
 
-    # Fallback: use remaining words
     return (
         all_words[start_idx]["start"],
         all_words[-1]["end"],
@@ -298,7 +414,6 @@ def _align_fallback(
     all_words: list[dict],
     start_idx: int,
 ) -> tuple[float, float, float, int]:
-    """Simple string-search alignment from start_idx."""
     search_words = all_words[start_idx:]
     full_text = "".join(
         normalize_japanese(w.get("punctuated_word", w.get("word", "")))
@@ -342,17 +457,17 @@ def _align_fallback(
 
 
 # ---------------------------------------------------------------------------
-# GPT / Claude analysis
+# Claude analysis
 # ---------------------------------------------------------------------------
 
-ANALYSIS_PROMPT = """You are an expert Japanese language analyst and tutor for Korean learners. Take a Japanese sentence, break it into smaller grammatically logical phrases/clauses, and provide detailed analysis for EACH phrase.
+ANALYSIS_PROMPT = """You are an expert Japanese language analyst and tutor for Korean learners. Analyze a Japanese segment by breaking it into grammatically meaningful phrases and explaining each one.
 
 Return ONLY a valid JSON object (no markdown fences, no extra text) with this structure:
 {
   "phrases": [
     {
       "number": 1,
-      "text": "phrase text",
+      "text": "exact phrase text from input",
       "words": [
         {"japanese": "word", "kanji": "kanji or empty string", "romaji": "romaji", "meaning": "Korean meaning"}
       ],
@@ -364,12 +479,21 @@ Return ONLY a valid JSON object (no markdown fences, no extra text) with this st
   ]
 }
 
+CRITICAL SPLITTING RULES:
+- Short sentences (under ~25 chars): keep as ONE phrase. Do NOT split.
+  Example: "俺、今日ファーストキスしちゃうんだ。" → 1 phrase
+  Example: "すいません、生一つお願いします。" → 1 phrase
+  Example: "マキマさん、ここにどうぞ。" → 1 phrase
+- Medium sentences (25-50 chars): split into 2-3 phrases at natural clause boundaries.
+- Long sentences (50+ chars): split into 2-4 phrases at clause boundaries (て form, から, が, けど, etc.)
+- NEVER make a phrase with just 1-2 words unless it's a complete clause.
+- The "text" field MUST be the EXACT substring from the input segment, including any punctuation.
+
 Guidelines:
-1. Break into natural grammatical phrases/clauses. Keep phrases under 15 characters if possible.
-2. Number each phrase sequentially (1, 2, 3...).
-3. For each word: japanese, kanji (empty string if none), romaji (Hepburn), meaning (Korean, concise).
-4. kanji_explanations: ONLY kanji in the current phrase. Include character, contextual reading, Korean meaning (e.g. "클 / 대" = Korean description + Hanja sound).
-5. Provide natural Korean translation of each phrase.
+1. Number each phrase sequentially (1, 2, 3...).
+2. For each word: japanese, kanji (empty string if none), romaji (Hepburn), meaning (Korean, concise).
+3. kanji_explanations: ONLY kanji in the current phrase. Include character, contextual reading, Korean meaning (e.g. "클 / 대" = Korean description + Hanja sound).
+4. Provide natural Korean translation of each phrase.
 
 Example for "ロシア大統領府によりますと":
 {
@@ -398,26 +522,21 @@ Return ONLY the JSON object."""
 
 
 def create_fallback_json(segment_text: str) -> dict:
-    """Create fallback analysis when Claude fails."""
     kanji_chars = [c for c in segment_text if 0x4E00 <= ord(c) <= 0x9FFF]
     ke = [{"kanji": c, "reading": "", "meaning": "분석 실패"} for c in kanji_chars]
     return {
-        "phrases": [
-            {
-                "number": 1,
-                "text": segment_text,
-                "words": [
-                    {
-                        "japanese": segment_text,
-                        "kanji": "".join(kanji_chars),
-                        "romaji": "",
-                        "meaning": "분석 실패",
-                    }
-                ],
-                "kanji_explanations": ke,
-                "meaning": segment_text,
-            }
-        ]
+        "phrases": [{
+            "number": 1,
+            "text": segment_text,
+            "words": [{
+                "japanese": segment_text,
+                "kanji": "".join(kanji_chars),
+                "romaji": "",
+                "meaning": "분석 실패",
+            }],
+            "kanji_explanations": ke,
+            "meaning": segment_text,
+        }]
     }
 
 
@@ -426,49 +545,31 @@ def analyze_japanese_segment(
     segment_start: float,
     segment_end: float,
     deepgram_words: list[dict],
+    previous_context: str = "",
 ) -> dict:
-    """Analyze a Japanese segment using Claude Opus 4.6.
-
-    Returns GPT-compatible JSON with phrases, words, kanji, meanings.
-    Phrases are aligned sequentially to Deepgram words (no overlap).
-    """
     client = get_claude_client()
     if not client:
-        print("Claude client not available.")
         return create_fallback_json(segment_text)
-
-    # Scale max_tokens to segment length
-    max_tokens = min(4096, max(1024, len(segment_text) * 50))
 
     max_retries = 2
     retry_delay = 3
+
+    user_msg = ANALYSIS_PROMPT + "\n\n"
+    if previous_context:
+        user_msg += f"Previous context (for reference only, do NOT analyze this): {previous_context}\n\n"
+    user_msg += f"Analyze this Japanese segment: {segment_text}"
 
     for attempt in range(max_retries):
         try:
             message = client.messages.create(
                 model="claude-opus-4-6",
-                max_tokens=max_tokens,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": f"{ANALYSIS_PROMPT}\n\nAnalyze this Japanese segment: {segment_text}",
-                    }
-                ],
+                max_tokens=4096,
+                messages=[{"role": "user", "content": user_msg}],
             )
 
-            response_text = message.content[0].text
-
-            # Strip any markdown fences just in case
-            response_text = response_text.strip()
-            if response_text.startswith("```"):
-                response_text = re.sub(
-                    r"^```(?:json)?\s*", "", response_text
-                )
-                response_text = re.sub(r"\s*```$", "", response_text)
-
+            response_text = _strip_json_fences(message.content[0].text)
             analysis = json.loads(response_text)
 
-            # FIXED: Sequential alignment - no overlap between phrases
             if "phrases" in analysis and deepgram_words:
                 last_word_index = 0
                 for p in analysis["phrases"]:
@@ -482,7 +583,6 @@ def analyze_japanese_segment(
                     p["match_score"] = score
                     last_word_index = new_idx
             elif "phrases" in analysis:
-                # No deepgram words - distribute evenly
                 n = len(analysis["phrases"])
                 duration = segment_end - segment_start
                 for i, p in enumerate(analysis["phrases"]):
@@ -513,12 +613,10 @@ def collect_vocab_with_kanji(
     speed_factor: float = 0.75,
     time_offset: float = 0.3,
 ):
-    """Collect kanji words from GPT analysis with real timings."""
     if not gpt_json or "phrases" not in gpt_json:
         return
 
     for phr in gpt_json["phrases"]:
-        # Build token-window lookup
         lookup = {}
         if phrase_sync_words:
             adj = 1.0 / speed_factor
@@ -526,14 +624,12 @@ def collect_vocab_with_kanji(
             toks = phrase_sync_words
             n = len(toks)
 
-            # Single tokens
             for t in toks:
                 lookup[norm_for_alignment(t["text"])] = (
                     t["start"] + off,
                     t["end"] + off,
                 )
 
-            # N-grams 2..8
             for span in range(2, min(9, n + 1)):
                 for i in range(n - span + 1):
                     win = toks[i : i + span]
@@ -552,16 +648,13 @@ def collect_vocab_with_kanji(
             k = norm_for_alignment(surf)
             start = end = None
 
-            # Exact match
             if k in lookup:
                 start, end = lookup[k]
-            # Fuzzy match
             elif FUZZY_MATCHING_AVAILABLE and lkeys:
                 hit, score, _ = process.extractOne(k, lkeys, scorer=fuzz.ratio)
                 if score >= 90:
                     start, end = lookup[hit]
 
-            # Discard micro-windows
             if start is not None and (end - start) < 0.15:
                 start = end = None
 

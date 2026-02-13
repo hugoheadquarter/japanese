@@ -1,25 +1,43 @@
 # lib/players.py
-"""HTML/JS player components using static file URLs instead of base64.
+"""HTML/JS player components.
 
-All audio is served via Streamlit's static file serving:
-  /_app/static/<video_dir>/<filename>
-
-This eliminates base64 encoding, reducing page payloads from 50-200MB to <1MB.
+Audio is served via public Supabase Storage URLs — no more base64 encoding.
+This is faster, uses less memory, and lets the browser stream large files.
 """
+
+from __future__ import annotations
 
 import json
 import time
 import streamlit as st
+from lib.storage import get_public_url
 
 
-def _audio_url(video_dir_name: str, filename: str) -> str:
-    """Build the static file URL for an audio file."""
-    return f"/_app/static/{video_dir_name}/{filename}"
+# ---------------------------------------------------------------------------
+# Audio URL helper
+# ---------------------------------------------------------------------------
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _audio_url(storage_path: str | None) -> str:
+    """Return the public URL for an audio file in Supabase Storage.
+    Returns empty string if path is None/empty."""
+    if not storage_path:
+        return ""
+    return get_public_url(storage_path)
 
 
-def _phrase_audio_url(video_dir_name: str, filename: str) -> str:
-    """Build the static file URL for a phrase audio file."""
-    return f"/_app/static/{video_dir_name}/phrases/{filename}"
+def _full_audio_url(video_dir: str, filename: str) -> str:
+    """Build the storage path and return the public URL for a full audio file."""
+    if not video_dir or not filename:
+        return ""
+    return _audio_url(f"{video_dir}/{filename}")
+
+
+def _phrase_audio_url(video_dir: str, filename: str | None) -> str:
+    """Build the storage path and return the public URL for a phrase clip."""
+    if not video_dir or not filename:
+        return ""
+    return _audio_url(f"{video_dir}/phrases/{filename}")
 
 
 # ---------------------------------------------------------------------------
@@ -32,28 +50,25 @@ def create_synchronized_player(
     words_for_sync: list[dict],
     height: int = 700,
 ):
-    """Full transcript player with word-level highlighting.
-
-    Uses static URL for audio instead of base64.
-    JS optimization: phrase groupings computed once, not on every timeupdate.
-    """
     if not audio_filename or not video_dir_name:
         st.warning("Audio file information missing.")
         return
 
-    audio_src = _audio_url(video_dir_name, audio_filename)
-    words_json = json.dumps(words_for_sync or [])
+    audio_src = _full_audio_url(video_dir_name, audio_filename)
+    if not audio_src:
+        st.warning("Audio file not found.")
+        return
 
+    words_json = json.dumps(words_for_sync or [])
     pid = f"main-{int(time.time() * 1000)}"
-    audio_id = f"audio-{pid}"
-    text_id = f"text-{pid}"
 
     html = f"""
-    <div id="container-{pid}" style="width:100%;font-family:sans-serif;">
-        <audio id="{audio_id}" controls style="width:100%;" preload="metadata">
-            <source src="{audio_src}" type="audio/mp3">
+    <div style="width:100%;font-family:sans-serif;">
+        <audio id="audio-{pid}" controls style="width:100%;" preload="metadata"
+               crossorigin="anonymous">
+            <source src="{audio_src}" type="audio/mpeg">
         </audio>
-        <div id="{text_id}"
+        <div id="text-{pid}"
              style="margin-top:10px;font-size:18px;line-height:1.8;
                     max-height:{height-100}px;overflow-y:auto;padding:5px;">
         </div>
@@ -62,12 +77,11 @@ def create_synchronized_player(
     (function(){{
         "use strict";
         const words={words_json};
-        const audio=document.getElementById('{audio_id}');
-        const display=document.getElementById('{text_id}');
+        const audio=document.getElementById('audio-{pid}');
+        const display=document.getElementById('text-{pid}');
         if(!audio||!display)return;
         if(!words||!words.length){{display.innerHTML='<p style="color:grey;text-align:center;">No transcript data.</p>';return;}}
 
-        // OPTIMIZED: compute phrase groupings ONCE
         function buildPhrases(){{
             const phrases=[];let cur=[];let lastEnd=0;
             words.forEach((w,i)=>{{
@@ -79,7 +93,6 @@ def create_synchronized_player(
                 }}
             }});
             if(cur.length>0)phrases.push(cur);
-            // merge short phrases
             const merged=[];
             for(let i=0;i<phrases.length;i++){{
                 const txt=phrases[i].map(w=>w.text).join('');
@@ -91,26 +104,21 @@ def create_synchronized_player(
         }}
 
         const PHRASES=buildPhrases();
-
-        // Build a flat index: wordIndex -> word object
         const flatWords=[];
         PHRASES.forEach(ph=>ph.forEach(w=>flatWords.push(w)));
 
         function render(){{
-            display.innerHTML='';
-            let idx=0;
+            display.innerHTML='';let idx=0;
             PHRASES.forEach(ph=>{{
                 const div=document.createElement('div');
                 div.style.marginBottom='10px';
                 ph.forEach(w=>{{
                     const span=document.createElement('span');
                     span.textContent=w.text;
-                    span.id='w-{pid}-'+idx;
-                    idx++;
+                    span.id='w-{pid}-'+idx;idx++;
                     span.style.cursor='pointer';
                     span.style.transition='color 0.2s,font-weight 0.2s';
-                    span.onclick=()=>{{audio.currentTime=w.start;audio.play().catch(()=>{{}});}};
-                    span.ondblclick=(e)=>{{e.preventDefault();audio.pause();}};
+                    span.onclick=()=>{{if(!audio.paused){{audio.pause();}}else{{audio.currentTime=w.start;audio.play().catch(()=>{{}});}}}};
                     div.appendChild(span);
                 }});
                 display.appendChild(div);
@@ -124,9 +132,7 @@ def create_synchronized_player(
                 if(!el)continue;
                 if(t>=flatWords[i].start&&t<flatWords[i].end){{
                     el.style.color='#ff4b4b';el.style.fontWeight='bold';active=el;
-                }}else{{
-                    el.style.color='';el.style.fontWeight='';
-                }}
+                }}else{{el.style.color='';el.style.fontWeight='';}}
             }}
             if(active&&display.contains(active)){{
                 const dr=display.getBoundingClientRect();
@@ -156,27 +162,25 @@ def create_phrase_player_html(
     phrase_unique_id: str,
     kanji_map: dict,
 ) -> str:
-    """Generate HTML/JS for a single phrase player.
-
-    Uses static URL for audio. Returns HTML string (not rendered directly).
-    """
     words_json = json.dumps(phrase_words or [])
     kanji_json = json.dumps(kanji_map, ensure_ascii=False)
 
-    audio_el_id = f"audio-phr-{phrase_unique_id}"
-    text_el_id = f"text-phr-{phrase_unique_id}"
-    status_id = f"status-phr-{phrase_unique_id}"
+    aid = f"audio-phr-{phrase_unique_id}"
+    tid = f"text-phr-{phrase_unique_id}"
 
     audio_tag = ""
     if phrase_audio_filename and video_dir_name:
         src = _phrase_audio_url(video_dir_name, phrase_audio_filename)
-        audio_tag = f'<audio id="{audio_el_id}" loop preload="none"><source src="{src}" type="audio/mp3"></audio>'
+        if src:
+            audio_tag = (
+                f'<audio id="{aid}" loop preload="none" crossorigin="anonymous">'
+                f'<source src="{src}" type="audio/mpeg"></audio>'
+            )
 
     return f"""
     <div class="phrase-player">
-        <div id="{status_id}" style="font-size:12px;color:#666;margin-bottom:5px;text-align:center;"></div>
         {audio_tag}
-        <div id="{text_el_id}"
+        <div id="{tid}"
              style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
                     font-size:30px;line-height:1.8;padding:5px 10px;cursor:pointer;">
         </div>
@@ -184,15 +188,15 @@ def create_phrase_player_html(
     <script>
     (function(){{
         "use strict";
-        if(!window.__pam){{window.__pam={{cur:null,clearFn:null,stopCur(){{
+        if(!window.parent.__pam){{window.parent.__pam={{cur:null,clearFn:null,stopCur(){{
             if(this.cur)try{{this.cur.pause();}}catch(_){{}}
             if(this.clearFn)this.clearFn();this.cur=null;this.clearFn=null;
         }}}};}}
 
         const W={words_json};
         const KM=JSON.parse('{kanji_json.replace(chr(39), chr(92)+chr(39))}');
-        const aud=document.getElementById('{audio_el_id}');
-        const txt=document.getElementById('{text_el_id}');
+        const aud=document.getElementById('{aid}');
+        const txt=document.getElementById('{tid}');
         if(!txt)return;
         if(!W||!W.length)return;
 
@@ -224,11 +228,13 @@ def create_phrase_player_html(
                 span.style.marginRight='2px';
                 span.onclick=()=>{{
                     if(!aud)return;
-                    window.__pam.stopCur();
-                    window.__pam.cur=aud;window.__pam.clearFn=clearHL;
-                    aud.currentTime=w.start;aud.play().catch(()=>{{}});
+                    if(!aud.paused&&window.parent.__pam.cur===aud){{aud.pause();}}
+                    else{{
+                        window.parent.__pam.stopCur();
+                        window.parent.__pam.cur=aud;window.parent.__pam.clearFn=clearHL;
+                        aud.currentTime=w.start;aud.play().catch(()=>{{}});
+                    }}
                 }};
-                span.ondblclick=(e)=>{{e.preventDefault();if(aud)aud.pause();}};
                 div.appendChild(span);
             }});
             txt.appendChild(div);
@@ -262,15 +268,6 @@ def generate_breakdown_html(
     video_dir_name: str,
     segment_id: int,
 ) -> str:
-    """Generate the full breakdown HTML for one segment's phrases.
-
-    Args:
-        phrases_data: List of GPT phrase dicts
-        phrase_audio_map: {phrase_idx: audio_filename}
-        phrase_sync_words_map: {phrase_idx: sync_words_list}
-        video_dir_name: For building audio URLs
-        segment_id: For unique IDs
-    """
     parts = []
     for i, phrase in enumerate(phrases_data):
         kanji_map = {
@@ -278,74 +275,104 @@ def generate_breakdown_html(
             for k in phrase.get("kanji_explanations", [])
             if k.get("kanji") and k.get("reading")
         }
-        audio_fn = phrase_audio_map.get(i)
-        sync_words = phrase_sync_words_map.get(i, [])
         uid = f"S{segment_id}_P{i}"
 
-        # Phrase player
-        player_html = create_phrase_player_html(
-            video_dir_name, audio_fn, sync_words, uid, kanji_map
-        )
-        parts.append(player_html)
+        parts.append(create_phrase_player_html(
+            video_dir_name, phrase_audio_map.get(i),
+            phrase_sync_words_map.get(i, []), uid, kanji_map,
+        ))
 
-        # Word table
         font = '-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif'
+
+        if phrase.get("meaning"):
+            parts.append(
+                f"<div style='margin-top:0;margin-bottom:12px;font-family:{font};'>"
+                f"<p style='font-size:20px;line-height:1.6;margin:0;color:#555;'>{phrase['meaning']}</p></div>"
+            )
+
+        kanji_explanations = phrase.get("kanji_explanations", [])
+        ke_lookup = {}
+        for ke in kanji_explanations:
+            ch = ke.get("kanji", "")
+            meaning = ke.get("meaning", "")
+            if ch:
+                ke_lookup[ch] = meaning
+
+        has_any_kanji = any(w.get("kanji") for w in phrase.get("words", []))
+
+        th_style = "border:1px solid #e0e0e0;padding:8px 12px;text-align:left;background-color:#f2f2f2;font-size:15px;"
+        td_style = "border:1px solid #e0e0e0;padding:8px 12px;text-align:left;font-size:15px;"
+
         table = f"<table style='width:100%;border-collapse:collapse;margin-bottom:15px;font-family:{font};'>"
         table += "<tr>"
-        for h in ["일본어", "로마자", "품사/설명", "한자"]:
-            table += f"<th style='border:1px solid #e0e0e0;padding:8px 12px;text-align:left;background-color:#f2f2f2;font-size:15px;'>{h}</th>"
+        table += f"<th style='{th_style}'>일본어</th>"
+        table += f"<th style='{th_style}'>로마자</th>"
+        table += f"<th style='{th_style}'>품사/설명</th>"
+        if has_any_kanji:
+            table += f"<th style='{th_style}'>한자</th>"
         table += "</tr>"
+
         for w in phrase.get("words", []):
             table += "<tr>"
-            for k in ["japanese", "romaji", "meaning", "kanji"]:
-                table += f"<td style='border:1px solid #e0e0e0;padding:8px 12px;text-align:left;font-size:15px;'>{w.get(k, '')}</td>"
+            table += f"<td style='{td_style}'>{w.get('japanese', '')}</td>"
+            table += f"<td style='{td_style}'>{w.get('romaji', '')}</td>"
+            table += f"<td style='{td_style}'>{w.get('meaning', '')}</td>"
+            if has_any_kanji:
+                kanji_str = w.get("kanji", "")
+                if kanji_str:
+                    kanji_parts = []
+                    for ch in kanji_str:
+                        cp = ord(ch)
+                        is_kanji = (0x4E00 <= cp <= 0x9FFF) or (0x3400 <= cp <= 0x4DBF) or (0xF900 <= cp <= 0xFAFF)
+                        if not is_kanji:
+                            continue
+                        m = ke_lookup.get(ch, "")
+                        if m:
+                            kanji_parts.append(f"<strong>{ch}</strong> <span style='color:#666;font-size:13px;'>{m}</span>")
+                        else:
+                            kanji_parts.append(f"<strong>{ch}</strong>")
+                    if kanji_parts:
+                        table += f"<td style='{td_style}'>{'<br>'.join(kanji_parts)}</td>"
+                    else:
+                        table += f"<td style='{td_style}'></td>"
+                else:
+                    table += f"<td style='{td_style}'></td>"
             table += "</tr>"
+
         table += "</table>"
         parts.append(table)
 
-        # Kanji explanations
-        if phrase.get("kanji_explanations"):
-            kanji_html = f"<div style='margin-top:5px;margin-bottom:10px;font-family:{font};'><ul class='kanji-list'>"
-            for k in phrase["kanji_explanations"]:
-                meaning = k.get("meaning", "")
-                fmt = meaning
-                if " / " in meaning:
-                    korean, hanja = meaning.split(" / ", 1)
-                    fmt = f"{korean} <strong>{hanja}</strong>"
-                kanji_html += (
-                    f"<li style='display:flex;align-items:baseline;margin-bottom:6px;font-size:15px;line-height:1.6;'>"
-                    f"<strong style='flex-basis:40px;flex-shrink:0;font-weight:bold;text-align:center;'>{k.get('kanji','')}</strong>"
-                    f"<span style='flex-basis:100px;flex-shrink:0;color:#4A4A4A;padding-left:8px;padding-right:8px;'>({k.get('reading','')})</span>"
-                    f"<span style='flex-grow:1;'>{fmt}</span></li>"
-                )
-            kanji_html += "</ul></div>"
-            parts.append(kanji_html)
-
-        # Meaning
-        if phrase.get("meaning"):
-            parts.append(
-                f"<div style='margin-top:5px;margin-bottom:15px;font-family:{font};'>"
-                f"<p style='font-size:20px;line-height:1.6;margin-top:0;'>{phrase['meaning']}</p></div>"
-            )
-
-        # Separator between phrases
         if i < len(phrases_data) - 1:
-            parts.append(
-                "<hr style='margin-top:15px;margin-bottom:15px;border:0;height:1px;background-color:#e0e0e0;'>"
-            )
+            parts.append("<hr style='margin-top:15px;margin-bottom:15px;border:0;height:1px;background-color:#e0e0e0;'>")
+
+    # Auto-resize
+    parts.append("""
+    <script>
+    (function(){
+        function sendHeight(){
+            var h=document.documentElement.scrollHeight;
+            if(h>10){
+                window.parent.postMessage({type:"streamlit:setFrameHeight",height:h},"*");
+            }
+        }
+        sendHeight();
+        setTimeout(sendHeight,100);
+        setTimeout(sendHeight,300);
+    })();
+    </script>
+    """)
 
     return "".join(parts)
 
 
 def estimate_segment_height(phrases: list[dict]) -> int:
-    """Estimate pixel height needed for a segment's breakdown HTML."""
-    total = 40  # buffer
+    total = 30
     for p in phrases:
-        base = 110 + 38 + 40  # player + header + meaning
+        total += 60 + 40 + 42 + 30
         word_rows = max(1, len(p.get("words", [])))
-        kanji_block = 20 if p.get("kanji_explanations") else 0
-        total += base + (word_rows * 30) + kanji_block
-    return max(200, min(total, 2000))
+        total += word_rows * 40
+        total += 20
+    return max(200, total)
 
 
 # ---------------------------------------------------------------------------
@@ -356,37 +383,14 @@ def create_vocab_component(
     vocab_map: dict,
     video_dir_name: str,
     audio_filename: str | None,
-    filter_query: str = "",
-    sort_by: str = "일본어순",
 ) -> str:
-    """Generate vocabulary card grid with audio playback.
+    sorted_items = sorted(
+        vocab_map.items(),
+        key=lambda kv: float("inf") if kv[1]["start"] is None else kv[1]["start"],
+    )
 
-    Uses static URL for audio instead of base64.
-    JS optimization: single timeupdate listener instead of setTimeout.
-    """
-    # Sort
-    if sort_by == "한자순":
-        sorted_items = sorted(vocab_map.items(), key=lambda x: x[1]["kanji"])
-    elif sort_by == "시간순":
-        sorted_items = sorted(
-            vocab_map.items(),
-            key=lambda kv: float("inf") if kv[1]["start"] is None else kv[1]["start"],
-        )
-    else:
-        sorted_items = sorted(vocab_map.items())
-
-    # Filter
-    fq = filter_query.lower()
-    filtered = [
-        (jp, info)
-        for jp, info in sorted_items
-        if not fq or fq in jp.lower() or fq in info["meaning"].lower()
-    ]
-
-    # Audio source
-    audio_src = ""
-    if audio_filename and video_dir_name:
-        audio_src = _audio_url(video_dir_name, audio_filename)
+    # Get public URL for the full slowed audio
+    audio_src = _full_audio_url(video_dir_name, audio_filename) if audio_filename else ""
 
     html = """
     <style>
@@ -400,26 +404,17 @@ def create_vocab_component(
     .vocab-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:15px;padding:10px;}
     rt{font-size:0.7em;color:#555;opacity:0.9;}
     .no-timing{border:1px dashed #ff9800!important;}
-    .ctrl-panel{text-align:center;margin-bottom:15px;padding:10px;background:#f8f8f8;border-radius:8px;}
-    .stop-btn{padding:6px 12px;background:#f44336;color:#fff;font-size:14px;border-radius:4px;
-        margin:5px;cursor:pointer;border:none;}
     </style>
     """
 
     if audio_src:
-        html += f'<audio id="vocab-aud" preload="metadata"><source src="{audio_src}" type="audio/mp3"></audio>'
+        html += f'<audio id="vocab-aud" preload="metadata" crossorigin="anonymous"><source src="{audio_src}" type="audio/mpeg"></audio>'
     else:
         html += '<audio id="vocab-aud"></audio>'
 
-    html += """
-    <div class="ctrl-panel">
-        <button onclick="stopVocab()" class="stop-btn">Stop All Audio</button>
-        <div id="vocab-status" style="margin-top:8px;font-size:14px;color:green;">Ready</div>
-    </div>
-    <div class="vocab-grid">
-    """
+    html += '<div class="vocab-grid">'
 
-    for jp, info in filtered:
+    for jp, info in sorted_items:
         jp_display = jp
         for kanji, reading in info.get("kanji_readings", {}).items():
             if kanji in jp_display:
@@ -427,8 +422,7 @@ def create_vocab_component(
                     kanji, f"<ruby>{kanji}<rt>{reading}</rt></ruby>"
                 )
 
-        start = info.get("start")
-        end = info.get("end")
+        start, end = info.get("start"), info.get("end")
         has_timing = start is not None and end is not None
         s_attr = f'data-start="{start}"' if has_timing else ""
         e_attr = f'data-end="{end}"' if has_timing else ""
@@ -443,57 +437,33 @@ def create_vocab_component(
 
     html += "</div>"
 
-    # OPTIMIZED: single timeupdate listener for bound checking instead of setTimeout
     html += """
     <script>
     (function(){
         const player=document.getElementById('vocab-aud');
-        const status=document.getElementById('vocab-status');
-        let curCard=null;
-        let endBound=null;
+        let curCard=null;let endBound=null;
 
-        // Use timeupdate to check bounds instead of setTimeout (no drift)
         if(player){
             player.addEventListener('timeupdate',function(){
                 if(endBound!==null&&player.currentTime>=endBound){
                     player.pause();
                     if(curCard){curCard.classList.remove('playing');curCard=null;}
                     endBound=null;
-                    status.innerHTML='<span style="color:green;">Ready</span>';
                 }
             });
         }
 
         window.playVocab=function(card){
-            if(!player){status.innerHTML='<span style="color:red;">No audio</span>';return;}
+            if(!player)return;
             const s=parseFloat(card.dataset.start);
             const e=parseFloat(card.dataset.end);
-            if(isNaN(s)||isNaN(e)){
-                card.style.border='2px solid orange';
-                setTimeout(()=>{card.style.border='';},2000);
-                return;
-            }
+            if(isNaN(s)||isNaN(e)){card.style.border='2px solid orange';setTimeout(()=>{card.style.border='';},2000);return;}
             if(curCard){curCard.classList.remove('playing');}
             card.classList.add('playing');curCard=card;
-
             const EXTRA=0.8;
-            const startT=s+0.3;
             endBound=Math.min(player.duration||e+EXTRA+1,e+EXTRA);
-
-            player.currentTime=startT;
-            player.play().then(()=>{
-                status.innerHTML='<span style="color:blue;">▶ Playing</span>';
-            }).catch(()=>{
-                status.innerHTML='<span style="color:orange;">Play failed</span>';
-                card.classList.remove('playing');
-            });
-        };
-
-        window.stopVocab=function(){
-            if(player)player.pause();
-            endBound=null;
-            if(curCard){curCard.classList.remove('playing');curCard=null;}
-            status.innerHTML='<span style="color:green;">Ready</span>';
+            player.currentTime=s+0.3;
+            player.play().catch(()=>{card.classList.remove('playing');});
         };
     })();
     </script>

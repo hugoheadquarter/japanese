@@ -371,18 +371,8 @@ def create_vocab_component(
     vocab_map: dict,
     video_dir_name: str,
     audio_filename: str | None,
-    filter_query: str = "",
-    sort_by: str = "일본어순",
 ) -> str:
-    if sort_by == "한자순":
-        sorted_items = sorted(vocab_map.items(), key=lambda x: x[1]["kanji"])
-    elif sort_by == "시간순":
-        sorted_items = sorted(vocab_map.items(), key=lambda kv: float("inf") if kv[1]["start"] is None else kv[1]["start"])
-    else:
-        sorted_items = sorted(vocab_map.items())
-
-    fq = filter_query.lower()
-    filtered = [(jp, info) for jp, info in sorted_items if not fq or fq in jp.lower() or fq in info["meaning"].lower()]
+    sorted_items = sorted(vocab_map.items(), key=lambda kv: float("inf") if kv[1]["start"] is None else kv[1]["start"])
 
     # Same file as transcript player → cache hit, no re-encode
     audio_b64 = ""
@@ -401,8 +391,6 @@ def create_vocab_component(
     .vocab-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:15px;padding:10px;}
     rt{font-size:0.7em;color:#555;opacity:0.9;}
     .no-timing{border:1px dashed #ff9800!important;}
-    .ctrl-panel{text-align:center;margin-bottom:15px;padding:10px;background:#f8f8f8;border-radius:8px;}
-    .stop-btn{padding:6px 12px;background:#f44336;color:#fff;font-size:14px;border-radius:4px;margin:5px;cursor:pointer;border:none;}
     </style>
     """
 
@@ -412,14 +400,10 @@ def create_vocab_component(
         html += '<audio id="vocab-aud"></audio>'
 
     html += """
-    <div class="ctrl-panel">
-        <button onclick="stopVocab()" class="stop-btn">Stop All Audio</button>
-        <div id="vocab-status" style="margin-top:8px;font-size:14px;color:green;">Ready</div>
-    </div>
     <div class="vocab-grid">
     """
 
-    for jp, info in filtered:
+    for jp, info in sorted_items:
         jp_display = jp
         for kanji, reading in info.get("kanji_readings", {}).items():
             if kanji in jp_display:
@@ -444,7 +428,6 @@ def create_vocab_component(
     <script>
     (function(){
         const player=document.getElementById('vocab-aud');
-        const status=document.getElementById('vocab-status');
         let curCard=null;let endBound=null;
 
         if(player){
@@ -453,13 +436,12 @@ def create_vocab_component(
                     player.pause();
                     if(curCard){curCard.classList.remove('playing');curCard=null;}
                     endBound=null;
-                    status.innerHTML='<span style="color:green;">Ready</span>';
                 }
             });
         }
 
         window.playVocab=function(card){
-            if(!player){status.innerHTML='<span style="color:red;">No audio</span>';return;}
+            if(!player)return;
             const s=parseFloat(card.dataset.start);
             const e=parseFloat(card.dataset.end);
             if(isNaN(s)||isNaN(e)){card.style.border='2px solid orange';setTimeout(()=>{card.style.border='';},2000);return;}
@@ -468,14 +450,7 @@ def create_vocab_component(
             const EXTRA=0.8;
             endBound=Math.min(player.duration||e+EXTRA+1,e+EXTRA);
             player.currentTime=s+0.3;
-            player.play().then(()=>{status.innerHTML='<span style="color:blue;">▶ Playing</span>';})
-            .catch(()=>{status.innerHTML='<span style="color:orange;">Play failed</span>';card.classList.remove('playing');});
-        };
-
-        window.stopVocab=function(){
-            if(player)player.pause();endBound=null;
-            if(curCard){curCard.classList.remove('playing');curCard=null;}
-            status.innerHTML='<span style="color:green;">Ready</span>';
+            player.play().catch(()=>{card.classList.remove('playing');});
         };
     })();
     </script>

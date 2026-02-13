@@ -1,12 +1,14 @@
-# review.py - Review / Replay page
-"""Review previously analyzed videos. Imports shared lib modules."""
+# pages/복습.py — Review / Replay page
+"""Review previously analyzed videos.  Streamlit multipage app."""
+
+from __future__ import annotations
 
 import streamlit as st
 import json
-import shutil
-from config import AUDIO_FILES_STORAGE_ROOT_ABS_PATH
+
+st.set_page_config(layout="wide", page_title="복습")
+
 from lib.database import (
-    get_db_connection,
     get_all_videos,
     get_video_by_id,
     delete_video,
@@ -16,11 +18,8 @@ from lib.database import (
     get_kanji_for_video,
     load_kanji_first_occurrences,
 )
-from lib.analysis import (
-    extract_words_for_sync,
-    extract_phrase_words_for_sync,
-    collect_vocab_with_kanji,
-)
+from lib.storage import delete_storage_folder
+from lib.analysis import collect_vocab_with_kanji
 from lib.players import (
     create_synchronized_player,
     generate_breakdown_html,
@@ -28,51 +27,45 @@ from lib.players import (
     create_vocab_component,
 )
 
-st.set_page_config(layout="wide", page_title="복습")
 
-
-# --- Caching (same pattern as jp.py) ---
+# --- Caching ---
 @st.cache_data(ttl=600)
-def _cached_segments(video_id):
-    conn = get_db_connection()
-    result = [dict(r) for r in get_segments_for_video(conn, video_id)]
-    conn.close()
-    return result
+def _cached_segments(video_id: int):
+    return get_segments_for_video(video_id)
 
 
 @st.cache_data(ttl=600)
-def _cached_phrases(segment_id):
-    conn = get_db_connection()
-    result = [dict(r) for r in get_phrase_analyses_for_segment(conn, segment_id)]
-    conn.close()
-    return result
+def _cached_phrases(segment_id: int):
+    return get_phrase_analyses_for_segment(segment_id)
 
 
 @st.cache_data(ttl=600)
-def _cached_kanji(video_id):
-    conn = get_db_connection()
-    result = [dict(r) for r in get_kanji_for_video(conn, video_id)]
-    conn.close()
-    return result
+def _cached_kanji(video_id: int):
+    return get_kanji_for_video(video_id)
 
 
 @st.cache_data(ttl=600)
-def _cached_vocab(video_id):
-    conn = get_db_connection()
-    rows = get_all_phrase_analyses_for_video(conn, video_id)
-    vocab = {}
+def _cached_vocab(video_id: int):
+    rows = get_all_phrase_analyses_for_video(video_id)
+    vocab: dict = {}
     for row in rows:
-        pd = json.loads(row["gpt_phrase_json"])
-        sw = json.loads(row["phrase_words_for_sync_json"]) if row["phrase_words_for_sync_json"] else None
+        pd = row["gpt_phrase_json"]
+        if isinstance(pd, str):
+            pd = json.loads(pd)
+        sw = row.get("phrase_words_for_sync_json")
+        if isinstance(sw, str):
+            sw = json.loads(sw)
         collect_vocab_with_kanji({"phrases": [pd]}, vocab, sw)
-    conn.close()
     return vocab
 
 
-# --- CSS (minimal, shared styles) ---
+# --- CSS ---
 st.markdown("""
 <style>
 .phrase-player audio{display:none!important;}
+div[data-testid="stHtml"]{margin-bottom:0!important;padding-bottom:0!important;}
+.stHtml{margin-bottom:0!important;padding-bottom:0!important;}
+.element-container:has(iframe){margin-bottom:0!important;padding-bottom:0!important;}
 rt{font-size:0.7em;opacity:0.9;user-select:none;}
 ul.kanji-list{padding-left:0!important;list-style-type:none!important;}
 .kanji-card-container{padding-top:10px;}
@@ -99,18 +92,16 @@ if "confirm_del" not in st.session_state:
 
 # --- Sidebar ---
 st.sidebar.title("복습")
-conn = get_db_connection()
-videos = get_all_videos(conn)
-conn.close()
+videos = get_all_videos()
 
 if not videos:
     st.sidebar.info("분석된 영상이 없습니다.")
     st.stop()
 
-options = {None: "--- 영상 선택 ---"}
+options: dict[int | None, str] = {None: "--- 영상 선택 ---"}
 for v in videos:
-    t = v["video_title"] or f"Video ID: {v['id']}"
-    options[v["id"]] = f"{t[:50]}{'...' if len(t)>50 else ''}"
+    t = v.get("video_title") or f"Video ID: {v['id']}"
+    options[v["id"]] = f"{t[:50]}{'...' if len(t) > 50 else ''}"
 
 chosen = st.sidebar.selectbox(
     "영상 목록:",
@@ -131,16 +122,13 @@ if st.session_state.sel_vid is None:
 
 # --- Main content ---
 vid_id = st.session_state.sel_vid
-conn = get_db_connection()
-video = get_video_by_id(conn, vid_id)
-conn.close()
+video = get_video_by_id(vid_id)
 
 if not video:
     st.error("영상을 찾을 수 없습니다.")
     st.session_state.sel_vid = None
     st.rerun()
 
-video = dict(video)
 video_dir = video.get("video_data_directory", "")
 audio_fn = video.get("full_slowed_audio_path", "")
 title = video.get("video_title", "")
@@ -158,13 +146,9 @@ if st.session_state.confirm_del == vid_id:
     st.warning(f"'{title}' 의 모든 데이터를 영구 삭제하시겠습니까?")
     c1, c2, _ = st.columns([1, 1, 5])
     if c1.button("Yes, Delete", key=f"yes_del_{vid_id}"):
-        conn = get_db_connection()
-        delete_video(conn, vid_id)
-        conn.close()
+        delete_video(vid_id)
         if video_dir:
-            d = AUDIO_FILES_STORAGE_ROOT_ABS_PATH / video_dir
-            if d.exists():
-                shutil.rmtree(d)
+            delete_storage_folder(video_dir)
         st.session_state.sel_vid = None
         st.session_state.confirm_del = None
         _cached_segments.clear()
@@ -179,42 +163,53 @@ if st.session_state.confirm_del == vid_id:
 
 
 # --- Tabs ---
-tabs = st.tabs(["Full Transcript", "Breakdown", "단어", "Kanji", "Text", "JSON"])
-tab1, tab2, tab_vocab, tab3, tab4, tab5 = tabs
+tabs = st.tabs(["Full Transcript", "Breakdown", "단어", "Kanji", "Text", "VIDEO"])
+tab1, tab2, tab_vocab, tab3, tab4, tab_video = tabs
 
 
 # Tab 1: Full transcript
 with tab1:
     sync_json = video.get("full_words_for_sync_json")
     if audio_fn and video_dir and sync_json:
-        words = json.loads(sync_json)
+        words = sync_json if isinstance(sync_json, list) else json.loads(sync_json)
         create_synchronized_player(video_dir, audio_fn, words)
     else:
         st.info("Audio or transcript data missing.")
 
 
-# Tab 2: Breakdown (lazy)
+# Tab 2: Breakdown
 with tab2:
     segments = _cached_segments(vid_id)
+    all_html_parts = []
+    total_height = 30
     for seg in segments:
         seg_id = seg["id"]
-        seg_text = seg.get("text", "")
-        with st.expander(f"#{seg['segment_index']+1}: {seg_text[:40]}...", expanded=True):
-            analyses = _cached_phrases(seg_id)
-            if not analyses:
-                continue
-            phrases_data = []
-            audio_map = {}
-            sync_map = {}
-            for a in analyses:
-                idx = a["phrase_index_in_segment"]
-                phrases_data.append(json.loads(a["gpt_phrase_json"]))
-                audio_map[idx] = a.get("phrase_slowed_audio_path")
-                sw = json.loads(a["phrase_words_for_sync_json"]) if a.get("phrase_words_for_sync_json") else []
-                sync_map[idx] = sw
-            html = generate_breakdown_html(phrases_data, audio_map, sync_map, video_dir, seg_id)
-            px = estimate_segment_height(phrases_data)
-            st.components.v1.html(html, height=px, scrolling=True)
+        analyses = _cached_phrases(seg_id)
+        if not analyses:
+            continue
+
+        phrases_data = []
+        audio_map = {}
+        sync_map = {}
+        for a in analyses:
+            idx = a["phrase_index_in_segment"]
+            pd = a["gpt_phrase_json"]
+            if isinstance(pd, str):
+                pd = json.loads(pd)
+            phrases_data.append(pd)
+            audio_map[idx] = a.get("phrase_slowed_audio_path")
+            sw = a.get("phrase_words_for_sync_json")
+            if isinstance(sw, str):
+                sw = json.loads(sw)
+            sync_map[idx] = sw if sw else []
+
+        html = generate_breakdown_html(phrases_data, audio_map, sync_map, video_dir, seg_id)
+        all_html_parts.append(html)
+        total_height += estimate_segment_height(phrases_data)
+
+    if all_html_parts:
+        combined = "".join(all_html_parts)
+        st.components.v1.html(combined, height=total_height, scrolling=False)
 
 
 # Tab 3 (vocab): 단어
@@ -223,12 +218,7 @@ with tab_vocab:
     if not vocab:
         st.info("한자가 포함된 단어가 없습니다.")
     else:
-        fc1, fc2 = st.columns([3, 1])
-        with fc1:
-            fq = st.text_input("검색", "", key=f"rvf_{vid_id}")
-        with fc2:
-            sort = st.selectbox("정렬", ["시간순", "일본어순", "한자순"], key=f"rvs_{vid_id}")
-        html = create_vocab_component(vocab, video_dir, audio_fn, fq, sort)
+        html = create_vocab_component(vocab, video_dir, audio_fn)
         h = min(800, len(vocab) * 150 + 200)
         st.components.v1.html(html, height=h, scrolling=True)
 
@@ -237,16 +227,14 @@ with tab_vocab:
 with tab3:
     entries = _cached_kanji(vid_id)
     if entries:
-        conn = get_db_connection()
-        order = load_kanji_first_occurrences(conn, vid_id)
-        conn.close()
+        order = load_kanji_first_occurrences(vid_id)
         sorted_k = sorted(entries, key=lambda r: order.get(r["character"], (float("inf"), 0)))
         cols = st.columns(4)
         st.markdown('<div class="kanji-card-container">', unsafe_allow_html=True)
         for idx, k in enumerate(sorted_k):
             with cols[idx % 4]:
                 k_desc, h_mean = "", ""
-                meaning = k["meaning"]
+                meaning = k.get("meaning", "")
                 if " / " in meaning:
                     parts = meaning.split(" / ", 1)
                     k_desc = parts[0]
@@ -256,7 +244,7 @@ with tab3:
                 hanja = f'<div><span class="value">{h_mean}</span></div>' if h_mean else ""
                 st.markdown(
                     f"""<div class="kanji-card"><div class="kanji-char-display">{k['character']}</div>
-                    <div class="kanji-info"><div><span class="value">{k['reading']}</span></div>
+                    <div class="kanji-info"><div><span class="value">{k.get('reading','')}</span></div>
                     <div><span class="value">{k_desc}</span></div>{hanja}</div></div>""",
                     unsafe_allow_html=True,
                 )
@@ -271,12 +259,20 @@ with tab4:
         st.download_button("Download", ft.encode("utf-8"), f"{title}_text.txt", "text/plain")
 
 
-# Tab 6: JSON
-with tab5:
-    rj = video.get("raw_deepgram_response_json")
-    if rj:
-        try:
-            st.json(json.loads(rj))
-        except json.JSONDecodeError:
-            st.error("JSON data corrupted.")
-        st.download_button("Download", rj.encode("utf-8"), f"{title}_deepgram.json", "application/json")
+# Tab 6: VIDEO
+with tab_video:
+    import re as _re
+    yt_url = video.get("youtube_url", "")
+    yt_match = _re.search(r'(?:v=|/v/|youtu\.be/)([a-zA-Z0-9_-]{11})', yt_url)
+    if yt_match:
+        yt_id = yt_match.group(1)
+        st.components.v1.html(
+            f'<iframe width="100%" height="500" src="https://www.youtube.com/embed/{yt_id}" '
+            f'frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; '
+            f'gyroscope; picture-in-picture" allowfullscreen></iframe>',
+            height=520,
+        )
+    else:
+        st.warning("YouTube URL을 인식할 수 없습니다.")
+        if yt_url:
+            st.markdown(f"[YouTube에서 열기]({yt_url})")

@@ -182,8 +182,8 @@ if st.session_state.confirm_del == vid_id:
 
 
 # --- Tabs ---
-tabs = st.tabs(["Full Transcript", "Breakdown", "단어", "Kanji", "Text", "JSON"])
-tab1, tab2, tab_vocab, tab3, tab4, tab5 = tabs
+tabs = st.tabs(["Full Transcript", "Breakdown", "단어", "Kanji", "Text", "VIDEO"])
+tab1, tab2, tab_vocab, tab3, tab4, tab_video = tabs
 
 
 # Tab 1: Full transcript
@@ -233,12 +233,7 @@ with tab_vocab:
     if not vocab:
         st.info("한자가 포함된 단어가 없습니다.")
     else:
-        fc1, fc2 = st.columns([3, 1])
-        with fc1:
-            fq = st.text_input("검색", "", key=f"rvf_{vid_id}")
-        with fc2:
-            sort = st.selectbox("정렬", ["시간순", "일본어순", "한자순"], key=f"rvs_{vid_id}")
-        html = create_vocab_component(vocab, video_dir, audio_fn, fq, sort)
+        html = create_vocab_component(vocab, video_dir, audio_fn)
         h = min(800, len(vocab) * 150 + 200)
         st.components.v1.html(html, height=h, scrolling=True)
 
@@ -282,11 +277,21 @@ with tab4:
 
 
 # Tab 6: JSON
-with tab5:
-    rj = video.get("raw_deepgram_response_json")
-    if rj:
-        try:
-            st.json(json.loads(rj))
-        except json.JSONDecodeError:
-            st.error("JSON data corrupted.")
-        st.download_button("Download", rj.encode("utf-8"), f"{title}_deepgram.json", "application/json")
+
+# Tab 6: VIDEO
+with tab_video:
+    import re as _re
+    yt_url = video.get("youtube_url", "")
+    yt_match = _re.search(r'(?:v=|/v/|youtu\.be/)([a-zA-Z0-9_-]{11})', yt_url)
+    if yt_match:
+        yt_id = yt_match.group(1)
+        st.components.v1.html(
+            f'<iframe width="100%" height="500" src="https://www.youtube.com/embed/{yt_id}" '
+            f'frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; '
+            f'gyroscope; picture-in-picture" allowfullscreen></iframe>',
+            height=520,
+        )
+    else:
+        st.warning("YouTube URL을 인식할 수 없습니다.")
+        if yt_url:
+            st.markdown(f"[YouTube에서 열기]({yt_url})")
