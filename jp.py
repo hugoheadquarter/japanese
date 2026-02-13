@@ -356,6 +356,11 @@ def run_full_pipeline(url: str, force: bool):
     status = st.empty()
     status.info("1단계: 준비 중...")
 
+    _t0 = time.time()
+    def _log_time(label):
+        elapsed = time.time() - _t0
+        print(f"[TIMER] {label}: {elapsed:.1f}s total")
+
     temp_dir_obj = None
 
     try:
@@ -374,12 +379,12 @@ def run_full_pipeline(url: str, force: bool):
             delete_video(existing["id"])
             if old_dir:
                 delete_storage_folder(old_dir)
-            # Clear caches
             cached_segments.clear()
             cached_phrase_analyses.clear()
             cached_kanji.clear()
             cached_kanji_order.clear()
             cached_vocab_map.clear()
+            _log_time("Old data deleted")
 
         # --- STAGE 1: Download & Transcribe ---
         status.info("1단계: 다운로드 중...")
@@ -387,6 +392,7 @@ def run_full_pipeline(url: str, force: bool):
         temp_dir = Path(temp_dir_obj.name)
 
         audio_path, title = download_audio(url, temp_dir)
+        _log_time("Download complete")
         if not audio_path:
             status.error("다운로드 실패.")
             return None
@@ -399,14 +405,17 @@ def run_full_pipeline(url: str, force: bool):
         slowed_fn = f"full_slowed_{video_id}.mp3"
         slowed_local = str(temp_dir / slowed_fn)
         slow_down_audio(audio_path, slowed_local)
+        _log_time("Slow down complete")
 
         # Upload slowed audio to Supabase Storage
         storage_audio_path = f"{video_dir}/{slowed_fn}"
         upload_audio(slowed_local, storage_audio_path)
         update_video_audio(video_id, slowed_fn)
+        _log_time("Slowed audio uploaded")
 
         status.info("2단계: 스크립트 변환 중...")
         transcript = transcribe_audio(audio_path)
+        _log_time("Transcription complete")
         if not transcript:
             status.error("스크립트 변환 실패.")
             return None
@@ -418,6 +427,7 @@ def run_full_pipeline(url: str, force: bool):
 
         sync_words = extract_words_for_sync(transcript)
         update_video_transcript(video_id, transcript, full_text, sync_words)
+        _log_time("Segments prepared")
 
         # Insert segments
         for seg_idx, seg in enumerate(segments_list):
@@ -425,6 +435,7 @@ def run_full_pipeline(url: str, force: bool):
                 video_id, seg_idx, seg["text"], seg["start"], seg["end"], seg["words"],
             )
             seg["db_id"] = db_id
+        _log_time(f"Segments inserted ({len(segments_list)})")
 
         # Create tabs
         tabs = st.tabs(["스크립트", "문장", "단어", "한자", "텍스트", "VIDEO"])
@@ -501,6 +512,8 @@ def run_full_pipeline(url: str, force: bool):
                 else:
                     status.info(f"구문 분석 {completed_count}/{total} 완료...")
 
+        _log_time("Claude analysis complete")
+
         # --- Process results: audio clips, DB, HTML ---
         status.info("3단계: 오디오 클립 생성 및 저장 중...")
 
@@ -510,6 +523,7 @@ def run_full_pipeline(url: str, force: bool):
 
         all_html_parts = []
         total_height = 30
+        total_clips = 0
 
         for i, seg in enumerate(segments_list):
             db_seg_id = seg["db_id"]
@@ -534,6 +548,7 @@ def run_full_pipeline(url: str, force: bool):
             audio_map = create_phrase_audio_clips(
                 audio_path, timings, phrases_local_dir, 0.75, db_seg_id,
             )
+            _log_time(f"Seg {i+1}/{total} clips created ({len(audio_map)} clips)")
 
             # Upload phrase clips to Supabase Storage (concurrent with retry)
             def _upload_clip(item):
@@ -559,6 +574,9 @@ def run_full_pipeline(url: str, force: bool):
                     if fn is None:
                         audio_map[p_idx] = None
 
+            total_clips += len(audio_map)
+            _log_time(f"Seg {i+1}/{total} clips uploaded (total: {total_clips})")
+
             # Prepare batch insert
             batch_rows = []
             sync_map: dict[int, list] = {}
@@ -574,9 +592,9 @@ def run_full_pipeline(url: str, force: bool):
                 batch_rows.append({
                     "segment_id": db_seg_id,
                     "phrase_index_in_segment": p_idx,
-                    "gpt_phrase_json": p_item,           # dict → JSONB
+                    "gpt_phrase_json": p_item,
                     "phrase_slowed_audio_path": p_audio_fn,
-                    "phrase_words_for_sync_json": p_sync, # list → JSONB
+                    "phrase_words_for_sync_json": p_sync,
                 })
 
             batch_insert_phrase_analyses(batch_rows)
@@ -587,6 +605,8 @@ def run_full_pipeline(url: str, force: bool):
             )
             all_html_parts.append(html)
             total_height += estimate_segment_height(phrases)
+
+        _log_time(f"All clips done ({total_clips} total)")
 
         # Render breakdown
         if all_html_parts:
@@ -601,10 +621,12 @@ def run_full_pipeline(url: str, force: bool):
         # --- STAGE 3: Kanji & Vocab ---
         status.info("4단계: 한자 추출 중...")
         extract_and_store_kanji(video_id)
+        _log_time("Kanji extraction complete")
 
         populate_vocab_tab(tab_vocab, video_id, video_dir, slowed_fn)
         populate_kanji_tab(tab_kanji, video_id)
 
+        _log_time("PIPELINE COMPLETE")
         status.success("모든 처리 완료!")
         st.session_state["last_video_id"] = video_id
 
@@ -618,6 +640,7 @@ def run_full_pipeline(url: str, force: bool):
         return {"video_id": video_id, "video_title": title}
 
     except Exception as e:
+        _log_time(f"ERROR: {e}")
         status.error(f"처리 오류: {e}")
         traceback.print_exc()
         return None
