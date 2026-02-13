@@ -562,7 +562,7 @@ def run_full_pipeline(url: str, force: bool):
                             print(f"[UPLOAD] Failed phrase clip {local_fn}: {exc}")
                 return (p_idx, None)
 
-            with ThreadPoolExecutor(max_workers=10) as upload_ex:
+            with ThreadPoolExecutor(max_workers=5) as upload_ex:
                 for p_idx, fn in upload_ex.map(_upload_clip, audio_map.items()):
                     if fn is None:
                         audio_map[p_idx] = None
