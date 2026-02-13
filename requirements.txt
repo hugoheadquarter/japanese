@@ -10,3 +10,4 @@ yt-dlp-ejs
 pybalt
 pyyaml
 python-dotenv
+aiohttp
