@@ -6,7 +6,7 @@ from __future__ import annotations
 import streamlit as st
 import json
 
-st.set_page_config(layout="wide", page_title="복습")
+st.set_page_config(layout="wide", page_title="Review")
 
 from lib.database import (
     get_all_videos,

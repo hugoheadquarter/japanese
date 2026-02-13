@@ -16,7 +16,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 # Page config (must be first st call)
-st.set_page_config(layout="centered", page_title="日本語")
+st.set_page_config(layout="wide", page_title="日本語")
 
 
 # --- Imports from lib ---
