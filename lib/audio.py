@@ -7,7 +7,7 @@ for uploading final outputs to Supabase Storage.
 Download strategy (in order):
   1. Supabase Edge Function – calls RapidAPI services from edge, uploads to Storage
   2. Piped API             – free proxy (unreliable, most instances dead)
-  3. Invidious API         – free proxy via ?local=true (also unreliable)
+  3. Invidious API         – free proxy via ?local=true (also unreliablee)
   4. yt-dlp                – works locally (residential IP not blocked)
 """
 
