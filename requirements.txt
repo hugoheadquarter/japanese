@@ -9,3 +9,4 @@ audioop-lts
 yt-dlp-ejs
 pybalt
 pyyaml
+python-dotenv
