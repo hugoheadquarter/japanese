@@ -14,49 +14,50 @@ from pydub import AudioSegment
 
 
 def download_audio(url: str, output_dir: Path) -> tuple[str | None, str | None]:
-    """Download audio from YouTube URL. Tries cobalt API first, falls back to yt-dlp."""
+    """Download audio from YouTube URL. Tries pybalt (cobalt) first, falls back to yt-dlp."""
     import yt_dlp
-    import requests as req
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # --- Try cobalt API first ---
+    # --- Get title via yt-dlp metadata (always works, even on cloud) ---
+    title = "video"
     try:
-        cobalt_resp = req.post(
-            "https://api.cobalt.tools/",
-            json={
-                "url": url,
-                "audioFormat": "mp3",
-                "audioBitrate": "192",
-                "downloadMode": "audio",
-            },
-            headers={
-                "Accept": "application/json",
-                "Content-Type": "application/json",
-            },
-            timeout=30,
-        )
-        cobalt_data = cobalt_resp.json()
-
-        if cobalt_data.get("status") in ("tunnel", "redirect"):
-            download_url = cobalt_data["url"]
-            # Get title via yt-dlp without downloading
-            with yt_dlp.YoutubeDL({"quiet": True, "noplaylist": True}) as ydl:
-                info = ydl.extract_info(url, download=False)
-                title = info.get("title", "video")
-
-            audio_resp = req.get(download_url, timeout=120)
-            audio_resp.raise_for_status()
-
-            safe_title = "".join(c for c in title if c.isalnum() or c in " -_")[:80]
-            filepath = output_dir / f"{safe_title}.mp3"
-            filepath.write_bytes(audio_resp.content)
-            print(f"[cobalt] Downloaded: {filepath.name}")
-            return str(filepath), title
-        else:
-            print(f"[cobalt] Failed: {cobalt_data}")
+        with yt_dlp.YoutubeDL({"quiet": True, "noplaylist": True}) as ydl:
+            info = ydl.extract_info(url, download=False)
+            title = info.get("title", "video")
     except Exception as e:
-        print(f"[cobalt] Error: {e}")
+        print(f"[meta] Title extraction failed: {e}")
+
+    # --- Try pybalt (cobalt instances) first ---
+    try:
+        import asyncio
+        from pybalt import download as pybalt_download
+
+        async def _download():
+            return await pybalt_download(
+                url,
+                downloadMode="audio",
+                audioFormat="mp3",
+                audioBitrate="192",
+                filepath=str(output_dir),
+            )
+
+        loop = asyncio.new_event_loop()
+        file_path = loop.run_until_complete(_download())
+        loop.close()
+
+        if file_path and os.path.exists(file_path):
+            # Rename to match expected title-based naming
+            safe_title = "".join(c for c in title if c.isalnum() or c in " -_")[:80]
+            target = output_dir / f"{safe_title}.mp3"
+            if str(file_path) != str(target):
+                os.rename(file_path, str(target))
+            print(f"[pybalt] Downloaded: {target.name}")
+            return str(target), title
+        else:
+            print(f"[pybalt] No file returned")
+    except Exception as e:
+        print(f"[pybalt] Error: {e}")
 
     # --- Fallback to yt-dlp ---
     ydl_opts = {
@@ -73,11 +74,22 @@ def download_audio(url: str, output_dir: Path) -> tuple[str | None, str | None]:
         "retries": 10,
         "fragment_retries": 10,
         "source_address": "0.0.0.0",
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android_vr", "web"],
+            }
+        },
+        "http_headers": {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        },
+        "sleep_interval": 3,
+        "max_sleep_interval": 6,
+        "format_sort": ["proto:m3u8"],
     }
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
-            title = info.get("title", "video")
+            title = info.get("title", title)
             mp3_files = list(output_dir.glob("*.mp3"))
             if not mp3_files:
                 return None, None

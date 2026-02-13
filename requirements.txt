@@ -7,3 +7,4 @@ requests
 rapidfuzz
 audioop-lts
 yt-dlp-ejs
+pybalt
