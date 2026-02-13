@@ -140,6 +140,8 @@ def _download_via_rapidapi(url: str, output_dir: Path) -> tuple[str | None, str 
             return None, None
 
         print(f"[rapidapi] Got MP3 link for: {title}")
+        time.sleep(2)  # Give CDN time to make file available
+
 
         # Download the MP3 from the CDN
         safe_title = re.sub(r'[^\w\s\-]', '', title)[:80].strip() or "audio"
@@ -160,7 +162,11 @@ def _download_via_rapidapi(url: str, output_dir: Path) -> tuple[str | None, str 
 
             print(f"[rapidapi] Downloading MP3...")
             try:
-                with requests.get(download_link, stream=True, timeout=180) as r:
+                with requests.get(download_link, stream=True, timeout=180, headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                    "Accept": "*/*",
+                    "Referer": "https://www.youtube.com/",
+                }, allow_redirects=True) as r:
                     if r.status_code == 404:
                         print(f"[rapidapi] CDN returned 404 — link expired")
                         continue
