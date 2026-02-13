@@ -145,23 +145,46 @@ def _download_via_rapidapi(url: str, output_dir: Path) -> tuple[str | None, str 
         safe_title = re.sub(r'[^\w\s\-]', '', title)[:80].strip() or "audio"
         mp3_path = output_dir / f"{safe_title}.mp3"
 
-        print("[rapidapi] Downloading MP3...")
-        with requests.get(download_link, stream=True, timeout=180) as r:
-            r.raise_for_status()
-            total = 0
-            with open(mp3_path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=65536):
-                    f.write(chunk)
-                    total += len(chunk)
-        print(f"[rapidapi] Downloaded {total / 1024 / 1024:.1f} MB")
+        # Download MP3 — retry with fresh link if CDN returns 404
+        for dl_attempt in range(3):
+            if dl_attempt > 0:
+                print(f"[rapidapi] CDN failed, requesting fresh link (attempt {dl_attempt + 1}/3)...")
+                time.sleep(3)
+                resp = requests.get(api_url, headers=headers, timeout=30)
+                data = resp.json()
+                if data.get("status") == "ok" and data.get("link"):
+                    download_link = data["link"]
+                    print(f"[rapidapi] Got fresh link")
+                else:
+                    continue
 
-        if mp3_path.exists() and mp3_path.stat().st_size > 10000:
-            print(f"[rapidapi] Success: {title}")
-            return str(mp3_path), title
-        else:
-            print("[rapidapi] File too small or missing — likely error")
-            mp3_path.unlink(missing_ok=True)
-            return None, None
+            print(f"[rapidapi] Downloading MP3...")
+            try:
+                with requests.get(download_link, stream=True, timeout=180) as r:
+                    if r.status_code == 404:
+                        print(f"[rapidapi] CDN returned 404 — link expired")
+                        continue
+                    r.raise_for_status()
+                    total = 0
+                    with open(mp3_path, "wb") as f:
+                        for chunk in r.iter_content(chunk_size=65536):
+                            f.write(chunk)
+                            total += len(chunk)
+                print(f"[rapidapi] Downloaded {total / 1024 / 1024:.1f} MB")
+
+                if mp3_path.exists() and mp3_path.stat().st_size > 10000:
+                    print(f"[rapidapi] Success: {title}")
+                    return str(mp3_path), title
+                else:
+                    print("[rapidapi] File too small or missing")
+                    mp3_path.unlink(missing_ok=True)
+                    continue
+            except requests.exceptions.HTTPError as e:
+                print(f"[rapidapi] Download HTTP error: {e}")
+                continue
+
+        print("[rapidapi] All download attempts failed")
+        return None, None
 
     except Exception as e:
         print(f"[rapidapi] Error: {e}")
