@@ -74,6 +74,18 @@ def _get_supabase_config() -> tuple[str, str]:
         return "", ""
 
 
+def _fetch_youtube_title(video_id: str) -> str | None:
+    """Fetch YouTube title via oEmbed API (free, no key needed)."""
+    try:
+        url = f"https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={video_id}&format=json"
+        resp = requests.get(url, timeout=10)
+        if resp.status_code == 200:
+            return resp.json().get("title")
+    except Exception:
+        pass
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Method 1: Supabase Edge Function (RECOMMENDED — works from cloud)
 # ---------------------------------------------------------------------------
@@ -125,9 +137,11 @@ def _download_via_edge_function(url: str, output_dir: Path) -> tuple[str | None,
             return None, None
 
         storage_url = data.get("url")
-        title = data.get("title", "video")
         size_mb = data.get("size_mb", "?")
         api_used = data.get("api_used", "unknown")
+
+        # Fetch real YouTube title (oEmbed), fall back to edge function response
+        title = _fetch_youtube_title(video_id) or data.get("title", video_id)
 
         if not storage_url:
             print("[edge-fn] No storage URL in response")
