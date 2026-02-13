@@ -517,27 +517,22 @@ def run_full_pipeline(url: str, force: bool):
         # --- Process results: audio clips, DB, HTML ---
         status.info("3단계: 오디오 클립 생성 및 저장 중...")
 
-        # Create temp dir for phrase clips
         phrases_local_dir = temp_dir / "phrases"
         phrases_local_dir.mkdir(exist_ok=True)
 
-        all_html_parts = []
+        all_html_parts = [None] * total  # preserve order
         total_height = 30
         total_clips = 0
 
-        for i, seg in enumerate(segments_list):
+        def _process_segment(i):
+            """Create clips + upload + DB insert for one segment."""
+            seg = segments_list[i]
             db_seg_id = seg["db_id"]
             analysis = analysis_results[i]
 
-            all_claude_analyses.append({
-                "segment_index": i,
-                "segment_text": seg["text"],
-                "claude_response": analysis,
-            })
-
             phrases = analysis.get("phrases", [])
             if not phrases:
-                continue
+                return (i, None, 0)
 
             timings = [
                 (p.get("original_start_time", 0), p.get("original_end_time", 0))
@@ -548,9 +543,8 @@ def run_full_pipeline(url: str, force: bool):
             audio_map = create_phrase_audio_clips(
                 audio_path, timings, phrases_local_dir, 0.75, db_seg_id,
             )
-            _log_time(f"Seg {i+1}/{total} clips created ({len(audio_map)} clips)")
 
-            # Upload phrase clips to Supabase Storage (concurrent with retry)
+            # Upload concurrently with retry
             def _upload_clip(item):
                 p_idx, local_fn = item
                 if not local_fn:
@@ -568,18 +562,14 @@ def run_full_pipeline(url: str, force: bool):
                             print(f"[UPLOAD] Failed phrase clip {local_fn}: {exc}")
                 return (p_idx, None)
 
-            with ThreadPoolExecutor(max_workers=10) as upload_executor:
-                results = list(upload_executor.map(_upload_clip, audio_map.items()))
-                for p_idx, fn in results:
+            with ThreadPoolExecutor(max_workers=10) as upload_ex:
+                for p_idx, fn in upload_ex.map(_upload_clip, audio_map.items()):
                     if fn is None:
                         audio_map[p_idx] = None
 
-            total_clips += len(audio_map)
-            _log_time(f"Seg {i+1}/{total} clips uploaded (total: {total_clips})")
-
             # Prepare batch insert
             batch_rows = []
-            sync_map: dict[int, list] = {}
+            sync_map = {}
             for p_idx, p_item in enumerate(phrases):
                 p_audio_fn = audio_map.get(p_idx)
                 p_sync = extract_phrase_words_for_sync(
@@ -599,19 +589,41 @@ def run_full_pipeline(url: str, force: bool):
 
             batch_insert_phrase_analyses(batch_rows)
 
-            # Collect HTML
+            # Generate HTML
             html = generate_breakdown_html(
                 phrases, audio_map, sync_map, video_dir, db_seg_id,
             )
-            all_html_parts.append(html)
-            total_height += estimate_segment_height(phrases)
+            return (i, html, len(audio_map))
+
+        # Run segments concurrently (5 at a time — CPU limited)
+        with ThreadPoolExecutor(max_workers=5) as seg_executor:
+            futures = {seg_executor.submit(_process_segment, i): i for i in range(total)}
+            completed = 0
+            for future in as_completed(futures):
+                i, html, clip_count = future.result()
+
+                all_claude_analyses.append({
+                    "segment_index": i,
+                    "segment_text": segments_list[i]["text"],
+                    "claude_response": analysis_results[i],
+                })
+
+                if html:
+                    all_html_parts[i] = html
+                    total_height += estimate_segment_height(
+                        analysis_results[i].get("phrases", [])
+                    )
+                total_clips += clip_count
+                completed += 1
+                if completed % 10 == 0:
+                    _log_time(f"Clips: {completed}/{total} segs done ({total_clips} clips)")
 
         _log_time(f"All clips done ({total_clips} total)")
 
         # Render breakdown
         if all_html_parts:
             with tab_breakdown:
-                combined = "".join(all_html_parts)
+                combined = "".join(h for h in all_html_parts if h)
                 st.components.v1.html(combined, height=total_height, scrolling=False)
 
         # Save debug
