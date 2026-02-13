@@ -5,7 +5,7 @@ All operations work on local temp files.  The caller (jp.py) is responsible
 for uploading final outputs to Supabase Storage.
 
 Download strategy (in order):
-  1. RapidAPI youtube-mp36 – paid API with residential proxies, works everywhere
+  1. Supabase Edge Function – calls RapidAPI services from edge, uploads to Storage
   2. Piped API             – free proxy (unreliable, most instances dead)
   3. Invidious API         – free proxy via ?local=true (also unreliable)
   4. yt-dlp                – works locally (residential IP not blocked)
@@ -66,134 +66,102 @@ def _extract_video_id(url: str) -> str | None:
     return None
 
 
-def _get_rapidapi_key() -> str:
-    """Get RapidAPI key from Streamlit Cloud secrets."""
+def _get_supabase_config() -> tuple[str, str]:
+    """Get Supabase URL and anon key from Streamlit secrets."""
     try:
-        return st.secrets["RAPIDAPI_KEY"]
+        return st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"]
     except Exception:
-        return ""
+        return "", ""
 
 
 # ---------------------------------------------------------------------------
-# Method 1: RapidAPI youtube-mp36 (RECOMMENDED — works from datacenter IPs)
+# Method 1: Supabase Edge Function (RECOMMENDED — works from cloud)
 # ---------------------------------------------------------------------------
 
-def _download_via_rapidapi(url: str, output_dir: Path) -> tuple[str | None, str | None]:
+def _download_via_edge_function(url: str, output_dir: Path) -> tuple[str | None, str | None]:
     """
-    Download audio via RapidAPI youtube-mp36 service.
+    Download audio via Supabase Edge Function.
 
-    Free tier: ~500 req/month.  Works from ANY IP including datacenter.
-    API key stored in Streamlit Cloud secrets as RAPIDAPI_KEY.
+    The edge function calls multiple RapidAPI services from a non-blocked IP,
+    downloads the MP3, and uploads it to Supabase Storage.
+    We then download from Storage (always works from any IP).
 
-    API: GET https://youtube-mp36.p.rapidapi.com/dl?id={videoId}
-    Returns: { "status": "ok", "link": "https://...", "title": "..." }
+    Returns (local_filepath, title) or (None, None).
     """
-    api_key = _get_rapidapi_key()
-    if not api_key:
-        print("[rapidapi] No RAPIDAPI_KEY found in Streamlit secrets — skipping")
-        print("[rapidapi] Add it in Streamlit Cloud: Settings → Secrets → RAPIDAPI_KEY = \"your-key\"")
+    supabase_url, supabase_key = _get_supabase_config()
+    if not supabase_url or not supabase_key:
+        print("[edge-fn] No SUPABASE_URL or SUPABASE_KEY in secrets — skipping")
         return None, None
 
     video_id = _extract_video_id(url)
     if not video_id:
-        print("[rapidapi] Could not extract video ID")
+        print("[edge-fn] Could not extract video ID")
         return None, None
 
-    api_url = f"https://youtube-mp36.p.rapidapi.com/dl?id={video_id}"
-    headers = {
-        "X-RapidAPI-Key": api_key,
-        "X-RapidAPI-Host": "youtube-mp36.p.rapidapi.com",
-    }
+    edge_url = f"{supabase_url}/functions/v1/youtube-mp3"
 
     try:
-        print(f"[rapidapi] Converting {video_id}...")
-        resp = requests.get(api_url, headers=headers, timeout=30)
-        resp.raise_for_status()
+        print(f"[edge-fn] Calling edge function for {video_id}...")
+        resp = requests.post(
+            edge_url,
+            json={"video_id": video_id},
+            headers={
+                "Authorization": f"Bearer {supabase_key}",
+                "Content-Type": "application/json",
+            },
+            timeout=120,  # Edge function polls async API, can take up to ~60s
+        )
+
         data = resp.json()
 
-        # Some videos need processing time — poll if needed
-        if data.get("status") != "ok":
-            msg = data.get("msg", "unknown error")
-            print(f"[rapidapi] API response: {msg}")
+        # Print edge function logs for debugging
+        if "log" in data:
+            for line in data["log"]:
+                print(f"  {line}")
 
-            if "process" in str(msg).lower() or "progress" in str(msg).lower() or data.get("status") == "processing":
-                for attempt in range(6):
-                    print(f"[rapidapi] Still processing... waiting 5s ({attempt + 1}/6)")
-                    time.sleep(5)
-                    resp = requests.get(api_url, headers=headers, timeout=30)
-                    data = resp.json()
-                    if data.get("status") == "ok":
-                        break
-                else:
-                    print("[rapidapi] Timed out waiting for conversion")
-                    return None, None
-
-        if data.get("status") != "ok":
-            print(f"[rapidapi] Final status not ok: {data}")
+        if resp.status_code != 200 or data.get("status") != "ok":
+            error = data.get("error", f"HTTP {resp.status_code}")
+            print(f"[edge-fn] Failed: {error}")
             return None, None
 
-        download_link = data.get("link")
+        storage_url = data.get("url")
         title = data.get("title", "video")
+        size_mb = data.get("size_mb", "?")
+        api_used = data.get("api_used", "unknown")
 
-        if not download_link:
-            print("[rapidapi] No download link in response")
+        if not storage_url:
+            print("[edge-fn] No storage URL in response")
             return None, None
 
-        print(f"[rapidapi] Got MP3 link for: {title}")
-        time.sleep(2)  # Give CDN time to make file available
+        print(f"[edge-fn] Success via {api_used}! {size_mb} MB")
+        print(f"[edge-fn] Title: {title}")
 
-
-        # Download the MP3 from the CDN
+        # Download from Supabase Storage to local file
         safe_title = re.sub(r'[^\w\s\-]', '', title)[:80].strip() or "audio"
         mp3_path = output_dir / f"{safe_title}.mp3"
 
-        # Download MP3 — retry with fresh link if CDN returns 404
-        for dl_attempt in range(3):
-            if dl_attempt > 0:
-                print(f"[rapidapi] CDN failed, requesting fresh link (attempt {dl_attempt + 1}/3)...")
-                time.sleep(3)
-                resp = requests.get(api_url, headers=headers, timeout=30)
-                data = resp.json()
-                if data.get("status") == "ok" and data.get("link"):
-                    download_link = data["link"]
-                    print(f"[rapidapi] Got fresh link")
-                else:
-                    continue
+        print(f"[edge-fn] Downloading from Supabase Storage...")
+        dl_resp = requests.get(storage_url, timeout=60)
+        dl_resp.raise_for_status()
 
-            print(f"[rapidapi] Downloading MP3...")
-            try:
-                with requests.get(download_link, stream=True, timeout=180, headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                    "Accept": "*/*",
-                    "Referer": "https://www.youtube.com/",
-                }, allow_redirects=True) as r:
-                    if r.status_code == 404:
-                        print(f"[rapidapi] CDN returned 404 — link expired")
-                        continue
-                    r.raise_for_status()
-                    total = 0
-                    with open(mp3_path, "wb") as f:
-                        for chunk in r.iter_content(chunk_size=65536):
-                            f.write(chunk)
-                            total += len(chunk)
-                print(f"[rapidapi] Downloaded {total / 1024 / 1024:.1f} MB")
+        with open(mp3_path, "wb") as f:
+            f.write(dl_resp.content)
 
-                if mp3_path.exists() and mp3_path.stat().st_size > 10000:
-                    print(f"[rapidapi] Success: {title}")
-                    return str(mp3_path), title
-                else:
-                    print("[rapidapi] File too small or missing")
-                    mp3_path.unlink(missing_ok=True)
-                    continue
-            except requests.exceptions.HTTPError as e:
-                print(f"[rapidapi] Download HTTP error: {e}")
-                continue
+        file_size = mp3_path.stat().st_size
+        print(f"[edge-fn] Saved {file_size / 1024 / 1024:.2f} MB to {mp3_path.name}")
 
-        print("[rapidapi] All download attempts failed")
+        if file_size < 1000:
+            print("[edge-fn] File too small — likely not valid audio")
+            mp3_path.unlink(missing_ok=True)
+            return None, None
+
+        return str(mp3_path), title
+
+    except requests.exceptions.Timeout:
+        print("[edge-fn] Timed out (>120s) — edge function may still be processing")
         return None, None
-
     except Exception as e:
-        print(f"[rapidapi] Error: {e}")
+        print(f"[edge-fn] Error: {e}")
         return None, None
 
 
@@ -281,7 +249,6 @@ def _download_via_invidious(url: str, output_dir: Path) -> tuple[str | None, str
                     print(f"[invidious] {instance} returned no audio formats")
                     continue
 
-                # Prefer itag 251 (opus ~160k) > 140 (m4a 128k)
                 best_format = None
                 for itag in [251, 140, 250, 249]:
                     for f in audio_formats:
@@ -356,7 +323,6 @@ def _download_and_convert(
         raw_path.unlink(missing_ok=True)
         return None, None
 
-    # Convert to MP3
     try:
         print(f"[{source}] Converting to MP3...")
         result = subprocess.run(
@@ -425,18 +391,18 @@ def download_audio(url: str, output_dir: Path) -> tuple[str | None, str | None]:
     """Download audio from YouTube URL.  Returns (filepath, title) or (None, None).
 
     Strategy:
-      1. RapidAPI youtube-mp36 (paid, works everywhere)
+      1. Supabase Edge Function (best — works from any cloud IP)
       2. Piped API (free, unreliable)
       3. Invidious API (free, unreliable)
       4. yt-dlp (local/residential IP only)
     """
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # --- 1. RapidAPI (best option for cloud) ---
-    print("[download] Trying RapidAPI...")
-    filepath, title = _download_via_rapidapi(url, output_dir)
+    # --- 1. Supabase Edge Function (best option for cloud) ---
+    print("[download] Trying Supabase Edge Function...")
+    filepath, title = _download_via_edge_function(url, output_dir)
     if filepath:
-        print(f"[download] RapidAPI succeeded: {title}")
+        print(f"[download] Edge function succeeded: {title}")
         return filepath, title
 
     # --- 2. Piped API ---
