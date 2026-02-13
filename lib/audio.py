@@ -116,7 +116,7 @@ def _download_via_rapidapi(url: str, output_dir: Path) -> tuple[str | None, str 
             msg = data.get("msg", "unknown error")
             print(f"[rapidapi] API response: {msg}")
 
-            if "processing" in str(msg).lower() or "progress" in str(msg).lower():
+            if "process" in str(msg).lower() or "progress" in str(msg).lower() or data.get("status") == "processing":
                 for attempt in range(6):
                     print(f"[rapidapi] Still processing... waiting 5s ({attempt + 1}/6)")
                     time.sleep(5)
