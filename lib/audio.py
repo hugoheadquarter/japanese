@@ -31,10 +31,10 @@ def download_audio(url: str, output_dir: Path) -> tuple[str | None, str | None]:
         "nocheckcertificate": True,
         "retries": 10,
         "fragment_retries": 10,
-        "source_address": "0.0.0.0",  # force IPv4
+        "source_address": "0.0.0.0",
         "extractor_args": {
             "youtube": {
-                "player_client": ["android_vr,web"],
+                "player_client": ["android_vr", "web"],
             }
         },
         "http_headers": {
@@ -42,6 +42,8 @@ def download_audio(url: str, output_dir: Path) -> tuple[str | None, str | None]:
         },
         "sleep_interval": 3,
         "max_sleep_interval": 6,
+        "prefer_free_formats": True,
+        "format_sort": ["proto:m3u8"],  # prefer HLS over HTTPS
     }
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
