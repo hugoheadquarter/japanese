@@ -535,15 +535,28 @@ def run_full_pipeline(url: str, force: bool):
                 audio_path, timings, phrases_local_dir, 0.75, db_seg_id,
             )
 
-            # Upload each phrase clip to Supabase Storage
-            for p_idx, local_fn in audio_map.items():
-                if local_fn:
-                    local_fp = str(phrases_local_dir / local_fn)
-                    storage_path = f"{video_dir}/phrases/{local_fn}"
+            # Upload phrase clips to Supabase Storage (concurrent with retry)
+            def _upload_clip(item):
+                p_idx, local_fn = item
+                if not local_fn:
+                    return (p_idx, None)
+                local_fp = str(phrases_local_dir / local_fn)
+                storage_path = f"{video_dir}/phrases/{local_fn}"
+                for attempt in range(3):
                     try:
                         upload_audio(local_fp, storage_path)
+                        return (p_idx, local_fn)
                     except Exception as exc:
-                        print(f"[UPLOAD] Failed phrase clip {local_fn}: {exc}")
+                        if attempt < 2:
+                            time.sleep(1 * (attempt + 1))
+                        else:
+                            print(f"[UPLOAD] Failed phrase clip {local_fn}: {exc}")
+                return (p_idx, None)
+
+            with ThreadPoolExecutor(max_workers=10) as upload_executor:
+                results = list(upload_executor.map(_upload_clip, audio_map.items()))
+                for p_idx, fn in results:
+                    if fn is None:
                         audio_map[p_idx] = None
 
             # Prepare batch insert
