@@ -623,7 +623,7 @@ def run_full_pipeline(url: str, force: bool):
         # Render breakdown
         if all_html_parts:
             with tab_breakdown:
-                combined = "".join(all_html_parts)
+                combined = "".join(h for h in all_html_parts if h)
                 st.components.v1.html(combined, height=total_height, scrolling=False)
 
         # Save debug
