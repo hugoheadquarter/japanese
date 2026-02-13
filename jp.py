@@ -151,6 +151,23 @@ div[data-testid="stHtml"]{margin-bottom:0!important;padding-bottom:0!important;}
     unsafe_allow_html=True,
 )
 
+def check_auth():
+    """Simple auth gate — must enter correct key to use app."""
+    if "authenticated" not in st.session_state:
+        st.session_state.authenticated = False
+
+    if not st.session_state.authenticated:
+        st.title("🔒")
+        key = st.text_input("Access key:", type="password")
+        if st.button("Submit"):
+            if key == st.secrets.get("AUTH_KEY", ""):
+                st.session_state.authenticated = True
+                st.rerun()
+            else:
+                st.error("Invalid key.")
+        st.stop()
+
+check_auth()
 
 # ---------------------------------------------------------------------------
 # Sidebar
