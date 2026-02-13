@@ -29,6 +29,8 @@ from lib.players import (
 )
 
 st.set_page_config(layout="wide", page_title="복습")
+from lib.auth import check_auth
+check_auth()
 
 
 # --- Caching (same pattern as jp.py) ---

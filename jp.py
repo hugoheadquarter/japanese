@@ -20,22 +20,7 @@ ensure_deno()
 # Page config (must be first st call)s
 st.set_page_config(layout="wide", page_title="日本語")
 
-def check_auth():
-    """Simple auth gate — must enter correct key to use app."""
-    if "authenticated" not in st.session_state:
-        st.session_state.authenticated = False
-
-    if not st.session_state.authenticated:
-        st.title("🔒")
-        key = st.text_input("Access key:", type="password")
-        if st.button("Submit"):
-            if key == st.secrets.get("AUTH_KEY", ""):
-                st.session_state.authenticated = True
-                st.rerun()
-            else:
-                st.error("Invalid key.")
-        st.stop()
-
+from lib.auth import check_auth
 check_auth()
 
 

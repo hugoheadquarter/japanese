@@ -8,6 +8,9 @@ import json
 
 st.set_page_config(layout="wide", page_title="Review")
 
+from lib.auth import check_auth
+check_auth()
+
 from lib.database import (
     get_all_videos,
     get_video_by_id,
