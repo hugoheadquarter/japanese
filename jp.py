@@ -17,11 +17,11 @@ from pathlib import Path
 from lib.ensure_deno import ensure_deno
 ensure_deno()
 
-# Page config (must be first st call)s
-st.set_page_config(layout="wide", page_title="日本語")
-
 from lib.auth import check_auth
 check_auth()
+
+# Page config (must be first st call)s
+st.set_page_config(layout="wide", page_title="日本語")
 
 
 # --- Imports from lib ---
